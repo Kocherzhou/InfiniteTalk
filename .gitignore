@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+
+# Model weights — NEVER commit (tens of GB)
+weights/
+
+# Secrets / local config
+.env
+webapp/.env
+
+# Runtime / generated
+save_audio/
+_worker/
+_jobs/
+inbox/
+outbox/
+out/
+webapp/uploads/
