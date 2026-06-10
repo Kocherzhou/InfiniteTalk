@@ -11,7 +11,9 @@ import os
 import time
 import uuid
 import json
+import shutil
 import threading
+import subprocess
 from pathlib import Path
 
 from flask import (Flask, request, jsonify, Response, render_template,
@@ -37,6 +39,67 @@ DEFAULT_PROMPT = ("A person performs into a microphone with expressive facial "
 
 IMAGE_EXTS = ("png", "jpg", "jpeg", "webp")
 AUDIO_EXTS = ("wav", "mp3", "m4a", "flac", "aac", "ogg")
+
+FFMPEG  = shutil.which("ffmpeg")  or "/home/kocher/miniconda3/bin/ffmpeg"
+FFPROBE = shutil.which("ffprobe") or "/home/kocher/miniconda3/bin/ffprobe"
+
+
+# ── 多机位 MTV 辅助：切歌 + 拼接（都在家里端用 ffmpeg） ───────────────────────
+def _audio_duration(path):
+    out = subprocess.run([FFPROBE, "-v", "error", "-show_entries", "format=duration",
+                          "-of", "default=nw=1:nk=1", str(path)],
+                         capture_output=True, text=True).stdout.strip()
+    return float(out)
+
+
+def _video_dims(path):
+    out = subprocess.run([FFPROBE, "-v", "error", "-select_streams", "v:0",
+                          "-show_entries", "stream=width,height",
+                          "-of", "csv=p=0:s=x", str(path)],
+                         capture_output=True, text=True).stdout.strip()
+    w, h = out.split("x")[:2]
+    return int(w), int(h)
+
+
+def split_audio_even(src, n, prefix):
+    """把 src 音频等分成 n 段 wav（16k 单声道，InfiniteTalk 友好）。返回 n 个路径。"""
+    dur = _audio_duration(src)
+    seg = dur / n
+    paths = []
+    for i in range(n):
+        p = f"{prefix}_seg{i}.wav"
+        cmd = [FFMPEG, "-y", "-ss", f"{i*seg:.3f}", "-i", str(src)]
+        if i < n - 1:
+            cmd += ["-t", f"{seg:.3f}"]          # 最后一段不限长，吃到结尾
+        cmd += ["-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", p]
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode != 0 or not os.path.exists(p):
+            raise RuntimeError(f"切第 {i+1} 段失败: {(r.stderr or '')[-200:]}")
+        paths.append(p)
+    return paths
+
+
+def stitch_clips(clip_paths, out_path):
+    """按序把多段 mp4 拼成一片：统一缩放+补边到第一段的尺寸，硬切（=机位切换）。"""
+    if not clip_paths:
+        raise RuntimeError("没有可拼接的片段")
+    if len(clip_paths) == 1:
+        shutil.copyfile(clip_paths[0], out_path)
+        return
+    W, H = _video_dims(clip_paths[0])
+    inputs, filt = [], []
+    for i, c in enumerate(clip_paths):
+        inputs += ["-i", str(c)]
+        filt.append(f"[{i}:v]scale={W}:{H}:force_original_aspect_ratio=decrease,"
+                    f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=25[v{i}]")
+    concat_in = "".join(f"[v{i}][{i}:a]" for i in range(len(clip_paths)))
+    filt.append(f"{concat_in}concat=n={len(clip_paths)}:v=1:a=1[v][a]")
+    cmd = [FFMPEG, "-y", *inputs, "-filter_complex", ";".join(filt),
+           "-map", "[v]", "-map", "[a]", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+           "-c:a", "aac", str(out_path)]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0 or not os.path.exists(out_path):
+        raise RuntimeError(f"ffmpeg 拼接失败: {(r.stderr or '')[-200:]}")
 
 app = Flask(__name__)
 
@@ -161,6 +224,100 @@ def api_create():
     return jsonify({"job_id": job_id})
 
 
+@app.route("/api/create_mtv", methods=["POST"])
+def api_create_mtv():
+    """多机位 MTV：N 张图 + 1 段歌 → 等分切歌 → N 个子任务入队 → 全部完成后自动拼接。
+    云端 worker 不感知父子关系，只当普通子任务逐个领走生成。"""
+    images = [im for im in request.files.getlist("images") if im and im.filename]
+    audio = request.files.get("audio")
+    if len(images) < 2:
+        return jsonify({"error": "多机位需要至少 2 张图片（1 张请用单段模式）"}), 400
+    if not audio or not audio.filename:
+        return jsonify({"error": "请上传音频"}), 400
+
+    prompt = (request.form.get("prompt") or "").strip() or DEFAULT_PROMPT
+    n = len(images)
+    parent_id = uuid.uuid4().hex
+    apath = UPLOAD_DIR / f"{parent_id}_audio.{_ext(audio.filename, AUDIO_EXTS, 'wav')}"
+    audio.save(str(apath))
+
+    try:
+        segs = split_audio_even(str(apath), n, str(UPLOAD_DIR / parent_id))
+    except Exception as e:
+        return jsonify({"error": f"切歌失败：{str(e)[:150]}"}), 500
+
+    t0 = time.time()
+    parent = {
+        "id": parent_id, "kind": "mtv", "status": "mtv_running", "progress": 3,
+        "message": f"已切成 {n} 段，{n} 个子任务排队中，等待云端逐段生成…",
+        "prompt": prompt, "logs": [], "created": t0, "n": n, "children": [],
+    }
+    add_log(parent, f"切歌完成（{n} 段），开始排队")
+
+    child_jobs = []
+    for i, im in enumerate(images):
+        cid = uuid.uuid4().hex
+        ipath = UPLOAD_DIR / f"{cid}_input.{_ext(im.filename, IMAGE_EXTS, 'png')}"
+        im.save(str(ipath))
+        capath = UPLOAD_DIR / f"{cid}_audio.wav"
+        os.replace(segs[i], str(capath))           # 段 wav 改名成子任务音频
+        child_jobs.append({
+            "id": cid, "status": "queued", "progress": 0, "message": "排队中…",
+            "prompt": prompt, "image_name": im.filename, "audio_name": f"第{i+1}段",
+            "logs": [], "created": t0 + i * 0.001,   # 保序：seg0 先被领
+            "_image": str(ipath), "_audio": str(capath),
+            "_parent": parent_id, "seg_index": i,
+        })
+        parent["children"].append(cid)
+
+    with _lock:
+        jobs[parent_id] = parent
+        for c in child_jobs:
+            jobs[c["id"]] = c
+    return jsonify({"job_id": parent_id})
+
+
+def _finalize_parent(child):
+    """子任务完成/失败后调用：聚合父任务进度；全部完成则触发拼接。"""
+    pid = child.get("_parent")
+    parent = jobs.get(pid) if pid else None
+    if not parent:
+        return
+    kids = [jobs.get(c) for c in parent["children"]]
+    done = [k for k in kids if k and k.get("status") == "completed"]
+    failed = [k for k in kids if k and k.get("status") == "error"]
+    n = parent["n"]
+    parent["progress"] = 5 + int(85 * len(done) / n)
+    parent["message"] = f"已完成 {len(done)}/{n} 段" + (f"（{len(failed)} 段失败）" if failed else "")
+    if len(done) + len(failed) < n:
+        return
+    if failed:
+        parent["status"] = "error"
+        parent["message"] = f"有 {len(failed)}/{n} 段失败，未拼接；已完成的段可单独下载"
+        add_log(parent, parent["message"], "error")
+        return
+    parent["status"] = "stitching"
+    parent["progress"] = 92
+    parent["message"] = "全部段完成，正在拼接整片…"
+    add_log(parent, "开始拼接 N 段")
+    threading.Thread(target=_do_stitch, args=(pid,), daemon=True).start()
+
+
+def _do_stitch(pid):
+    parent = jobs.get(pid)
+    try:
+        clips = [str(UPLOAD_DIR / f"{c}_out.mp4") for c in parent["children"]]
+        stitch_clips(clips, UPLOAD_DIR / f"{pid}_out.mp4")
+        parent["status"] = "completed"
+        parent["progress"] = 100
+        parent["message"] = "多机位 MTV 拼接完成 ✓"
+        add_log(parent, "拼接完成，整片已生成", "success")
+    except Exception as e:
+        parent["status"] = "error"
+        parent["message"] = f"拼接失败：{str(e)[:120]}（子片段可单独下载）"
+        add_log(parent, parent["message"], "error")
+
+
 @app.route("/api/status/<job_id>")
 def api_status(job_id):
     def generate():
@@ -229,6 +386,11 @@ def worker_progress(job_id):
             job[k] = d[k]
     if d.get("log"):
         add_log(job, str(d["log"]), d.get("log_type", "info"))
+    # 子任务进度时，顺带刷新父任务的"第 k/N 段生成中"提示
+    pid = job.get("_parent")
+    parent = jobs.get(pid) if pid else None
+    if parent and parent.get("status") == "mtv_running":
+        parent["message"] = f"第 {job.get('seg_index', 0) + 1}/{parent['n']} 段云端生成中…"
     return jsonify({"ok": True})
 
 
@@ -242,6 +404,7 @@ def worker_result(job_id):
         job["status"] = "error"
         job["message"] = f"云端生成失败：{err}"
         add_log(job, job["message"], "error")
+        _finalize_parent(job)
         return jsonify({"ok": True})
     f = request.files.get("video")
     if not f:
@@ -252,6 +415,7 @@ def worker_result(job_id):
     job["progress"] = 100
     job["message"] = "生成完成 ✓"
     add_log(job, "成品已回传", "success")
+    _finalize_parent(job)
     return jsonify({"ok": True})
 
 

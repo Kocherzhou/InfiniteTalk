@@ -108,9 +108,9 @@
         <div class="drop-body" id="imgBody">
           <div class="drop-icon">🖼️</div>
           <div class="drop-title">立绘 / 人像图片</div>
-          <div class="drop-hint">点击或拖入 PNG / JPG</div>
+          <div class="drop-hint">点击或拖入 PNG / JPG · <strong>可多选=多机位</strong></div>
         </div>
-        <input type="file" id="fileImage" accept="image/*" hidden>
+        <input type="file" id="fileImage" accept="image/*" multiple hidden>
       </div>
       <div class="drop" id="dropAudio" tabindex="0">
         <div class="drop-body" id="audBody">
@@ -158,7 +158,7 @@
 </div>
 
 <script>
-  let imgFile = null, audFile = null, evt = null, curJob = null;
+  let imgFiles = [], audFile = null, evt = null, curJob = null;
 
   function bindDrop(dropEl, inputEl, accept, onPick) {
     dropEl.addEventListener('click', () => inputEl.click());
@@ -169,14 +169,34 @@
     dropEl.addEventListener('drop', e => { const f = e.dataTransfer.files[0]; if (f) onPick(f); });
   }
 
-  bindDrop(document.getElementById('dropImage'), document.getElementById('fileImage'), 'image', f => {
-    imgFile = f;
-    const url = URL.createObjectURL(f);
-    document.getElementById('imgBody').innerHTML =
-      `<div class="drop-title">🖼️ ${f.name}</div><img class="preview" src="${url}">`;
-    document.getElementById('dropImage').classList.add('filled');
+  // 图片区：支持多选（多机位）。每次选/拖会"追加"，方便分多次挑图。
+  function addImages(fileList) {
+    for (const f of fileList) if (f && f.type.startsWith('image/')) imgFiles.push(f);
+    renderImages();
     refreshGo();
-  });
+  }
+  function renderImages() {
+    if (!imgFiles.length) return;
+    const thumbs = imgFiles.map((f, i) =>
+      `<div style="position:relative;display:inline-block;margin:3px">
+         <img class="preview" style="max-height:84px" src="${URL.createObjectURL(f)}">
+         <span style="position:absolute;top:2px;left:2px;background:#000a;color:#fff;border-radius:4px;padding:0 5px;font-size:11px">${i + 1}</span>
+       </div>`).join('');
+    const tip = imgFiles.length === 1
+      ? '1 张 = 单机位整段' : `${imgFiles.length} 张 = 多机位（按序切歌拼接）`;
+    document.getElementById('imgBody').innerHTML =
+      `<div class="drop-title">🖼️ ${tip}</div><div>${thumbs}</div>
+       <div class="drop-hint">再点可继续追加；清空请刷新页面</div>`;
+    document.getElementById('dropImage').classList.add('filled');
+  }
+  (function () {
+    const drop = document.getElementById('dropImage'), inp = document.getElementById('fileImage');
+    drop.addEventListener('click', () => inp.click());
+    inp.addEventListener('change', () => addImages(inp.files));
+    ['dragover', 'dragenter'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.add('dragging'); }));
+    ['dragleave', 'drop'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove('dragging'); }));
+    drop.addEventListener('drop', e => addImages(e.dataTransfer.files));
+  })();
   bindDrop(document.getElementById('dropAudio'), document.getElementById('fileAudio'), 'audio', f => {
     audFile = f;
     const url = URL.createObjectURL(f);
@@ -186,18 +206,30 @@
     refreshGo();
   });
 
-  function refreshGo() { document.getElementById('goBtn').disabled = !(imgFile && audFile); }
+  function refreshGo() {
+    const btn = document.getElementById('goBtn');
+    btn.disabled = !(imgFiles.length && audFile);
+    btn.textContent = imgFiles.length > 1
+      ? `🎬 生成多机位 MTV（${imgFiles.length} 段）` : '🎬 开始生成对口型视频';
+  }
 
   document.getElementById('goBtn').addEventListener('click', async () => {
-    if (!imgFile || !audFile) return;
+    if (!imgFiles.length || !audFile) return;
     const btn = document.getElementById('goBtn');
     btn.disabled = true; btn.textContent = '上传中…';
     const form = new FormData();
-    form.append('image', imgFile);
     form.append('audio', audFile);
     form.append('prompt', document.getElementById('prompt').value);
+    let url;
+    if (imgFiles.length > 1) {            // 多机位
+      imgFiles.forEach(f => form.append('images', f));
+      url = '/api/create_mtv';
+    } else {                              // 单段
+      form.append('image', imgFiles[0]);
+      url = '/api/create';
+    }
     try {
-      const r = await fetch('/api/create', { method: 'POST', body: form });
+      const r = await fetch(url, { method: 'POST', body: form });
       const d = await r.json();
       if (d.error) throw new Error(d.error);
       curJob = d.job_id;
@@ -206,7 +238,7 @@
       listen(d.job_id);
     } catch (e) {
       alert('提交失败：' + e.message);
-      btn.disabled = false; btn.textContent = '🎬 开始生成对口型视频';
+      btn.disabled = false; refreshGo();
     }
   });
 
@@ -237,7 +269,7 @@
     const s = d.status;
     setStep('s-up', 'done');
     if (s === 'queued') { setStep('s-queue', 'active'); }
-    else if (s === 'claimed' || s === 'generating' || s === 'uploading') {
+    else if (['claimed', 'generating', 'uploading', 'mtv_running', 'stitching'].includes(s)) {
       setStep('s-queue', 'done'); setStep('s-gen', 'active');
     } else if (s === 'completed') {
       setStep('s-queue', 'done'); setStep('s-gen', 'done'); setStep('s-done', 'done');
