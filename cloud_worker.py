@@ -54,6 +54,9 @@ LORA_DIR     = "weights/lora/FusionX_LoRa/Wan2.1_I2V_14B_FusionX_LoRA.safetensor
 LORA_SCALE   = 1.0
 SAMPLE_STEPS = 8       # 配 FusionX：8 步；不用 LoRA 时回 40
 SAMPLE_SHIFT = 2.0     # FusionX 推荐
+# 一段视频最多生成多少帧。默认 1000 帧≈40 秒，会把更长的音频截断！
+# 整首歌(单图)或长片段必须调大,否则只出 40 秒。流式逐窗生成,显存不随之增长。
+MAX_FRAME_NUM = 100000
 TEXT_GUIDE   = 1.0     # CFG=1（配蒸馏 LoRA），也省显存
 AUDIO_GUIDE  = 2.0
 NUM_PERSISTENT_PARAM_IN_DIT = None   # 24GB+ 用 None(最快)；OOM 再设整数；极限设 0
@@ -114,6 +117,7 @@ def build_cmd(input_json, save_stem):
         "--input_json", str(input_json),
         "--size", SIZE,
         "--sample_steps", str(SAMPLE_STEPS),
+        "--max_frame_num", str(MAX_FRAME_NUM),
         "--mode", MODE,
         "--motion_frame", str(MOTION_FRAME),
         "--sample_shift", str(SAMPLE_SHIFT),
