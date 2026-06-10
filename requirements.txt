@@ -1,7 +1,10 @@
 opencv-python>=4.9.0.80
 diffusers>=0.31.0
-transformers>=4.49.0
+# 锁定 4.49.0：更新版引用 torch 2.7 才有的 float8_e8m0fnu，会在 torch 2.5 上 import 崩。
+transformers==4.49.0
 tokenizers>=0.20.3
+soundfile
+librosa
 accelerate>=1.1.1
 tqdm
 imageio

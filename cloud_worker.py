@@ -45,10 +45,16 @@ INFINITETALK = "weights/InfiniteTalk/single/infinitetalk.safetensors"
 SIZE         = "infinitetalk-480"
 MODE         = "streaming"
 MOTION_FRAME = 9
-USE_FP8      = True
+# 全精度（我们没下 fp8 量化包）。48G 卡跑全精度没问题。想用 fp8 再下量化包并设 True。
+USE_FP8      = False
 QUANT_DIR    = "weights/InfiniteTalk/quant_models/infinitetalk_single_fp8.safetensors"
 SAMPLE_STEPS = 40
 NUM_PERSISTENT_PARAM_IN_DIT = None   # 24GB+ 用 None(最快)；OOM 再设整数；极限设 0
+# 关键速度开关：offload_model 默认 True 会每步把 DiT 卸到 CPU（给小显存卡用），
+# 在 48G 卡上慢 5-10 倍（曾实测 46s/step）。关掉它让 DiT 常驻显存。
+OFFLOAD_MODEL = False
+# T5 文本编码器放 CPU（只在开头编码一次提示词），给显存腾出 ~11G，配合 offload=False 防 OOM。
+T5_CPU       = True
 # ──────────────────────────────────────────────────────────────────────────────
 
 # httpx 客户端：trust_env=False 绕过 .env 的 socks 代理（家里/云端都避免误走代理）。
@@ -103,8 +109,11 @@ def build_cmd(input_json, save_stem):
         "--sample_steps", str(SAMPLE_STEPS),
         "--mode", MODE,
         "--motion_frame", str(MOTION_FRAME),
+        "--offload_model", str(OFFLOAD_MODEL),   # False = DiT 常驻显存（48G 卡，快很多）
         "--save_file", str(save_stem),
     ]
+    if T5_CPU:
+        cmd += ["--t5_cpu"]
     if USE_FP8:
         cmd += ["--quant", "fp8", "--quant_dir", QUANT_DIR]
     if NUM_PERSISTENT_PARAM_IN_DIT is not None:
