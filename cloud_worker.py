@@ -48,7 +48,14 @@ MOTION_FRAME = 9
 # 全精度（我们没下 fp8 量化包）。48G 卡跑全精度没问题。想用 fp8 再下量化包并设 True。
 USE_FP8      = False
 QUANT_DIR    = "weights/InfiniteTalk/quant_models/infinitetalk_single_fp8.safetensors"
-SAMPLE_STEPS = 40
+# FusionX 步数蒸馏 LoRA：把 40 步压到 8 步、CFG 降到 1（每步少跑无条件分支）→ 约快 8-10 倍
+# （实测 31min/clip → ~4min/clip）。这是让全精度 Wan-14B 可用的关键。设 LORA_DIR="" 可关。
+LORA_DIR     = "weights/lora/FusionX_LoRa/Wan2.1_I2V_14B_FusionX_LoRA.safetensors"
+LORA_SCALE   = 1.0
+SAMPLE_STEPS = 8       # 配 FusionX：8 步；不用 LoRA 时回 40
+SAMPLE_SHIFT = 2.0     # FusionX 推荐
+TEXT_GUIDE   = 1.0     # CFG=1（配蒸馏 LoRA），也省显存
+AUDIO_GUIDE  = 2.0
 NUM_PERSISTENT_PARAM_IN_DIT = None   # 24GB+ 用 None(最快)；OOM 再设整数；极限设 0
 # 关键速度开关：offload_model 默认 True 会每步把 DiT 卸到 CPU（给小显存卡用），
 # 在 48G 卡上慢 5-10 倍（曾实测 46s/step）。关掉它让 DiT 常驻显存。
@@ -109,9 +116,14 @@ def build_cmd(input_json, save_stem):
         "--sample_steps", str(SAMPLE_STEPS),
         "--mode", MODE,
         "--motion_frame", str(MOTION_FRAME),
+        "--sample_shift", str(SAMPLE_SHIFT),
+        "--sample_text_guide_scale", str(TEXT_GUIDE),
+        "--sample_audio_guide_scale", str(AUDIO_GUIDE),
         "--offload_model", str(OFFLOAD_MODEL),   # False = DiT 常驻显存（48G 卡，快很多）
         "--save_file", str(save_stem),
     ]
+    if LORA_DIR:
+        cmd += ["--lora_dir", LORA_DIR, "--lora_scale", str(LORA_SCALE)]
     if T5_CPU:
         cmd += ["--t5_cpu"]
     if USE_FP8:
