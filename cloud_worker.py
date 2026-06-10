@@ -147,7 +147,12 @@ def run_infinitetalk(cli, job, img_path, aud_path):
     progress(cli, job_id, status="generating", progress=20,
              message="云端生成中（InfiniteTalk）…", log="开始 InfiniteTalk 推理")
     cmd = build_cmd(input_json, save_stem)
-    proc = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
+    # expandable_segments 整理显存碎片，避免全精度+LoRA 在 48G 卡上 VAE 解码时 OOM；
+    # OMP_NUM_THREADS 给 AutoDL 镜像的非法默认值兜底。
+    gen_env = {**os.environ,
+               "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+               "OMP_NUM_THREADS": "8"}
+    proc = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, env=gen_env)
     out_mp4 = Path(f"{save_stem}.mp4")
     if proc.returncode != 0 or not out_mp4.exists():
         tail = (proc.stderr or proc.stdout or "")[-300:]
