@@ -16,7 +16,9 @@ if [ "$WEIGHTS_DIR" != "/app/weights" ]; then
 fi
 mkdir -p /app/weights
 
-WEIGHTS_MARK="weights/Wan2.1-I2V-14B-480P/config.json"
+# 完整性标志用「最后一个下载的文件」（FusionX LoRA）：它存在 ⇒ 前面全下完了。
+# 旧版用 config.json 会误判——它下得早，模型本体还没下完就被当成「已就位」跳过。
+WEIGHTS_MARK="weights/lora/FusionX_LoRa/Wan2.1_I2V_14B_FusionX_LoRA.safetensors"
 if [ ! -f "$WEIGHTS_MARK" ]; then
   echo "[entrypoint] 权重缺失 → 下载到 ./weights（挂卷可持久化，下次跳过）"
   bash docker/download_weights.sh
