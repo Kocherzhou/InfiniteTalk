@@ -60,6 +60,10 @@ SAMPLE_SHIFT = 2.0     # FusionX 推荐
 MAX_FRAME_NUM = 100000
 TEXT_GUIDE   = 1.0     # CFG=1（配蒸馏 LoRA），也省显存
 AUDIO_GUIDE  = 2.0
+# TeaCache：跳过扩散步间的冗余计算，Wan 系实测 ~1.5-2x 提速、基本不掉质量。
+# thresh 越大越激进越快、质量风险越高；0.2 是 README 推荐的保守值。设 False 关闭。
+USE_TEACACHE   = True
+TEACACHE_THRESH = 0.2
 NUM_PERSISTENT_PARAM_IN_DIT = None   # 24GB+ 用 None(最快)；OOM 再设整数；极限设 0
 # 关键速度开关：offload_model 默认 True 会每步把 DiT 卸到 CPU（给小显存卡用），
 # 在 48G 卡上慢 5-10 倍（曾实测 46s/step）。关掉它让 DiT 常驻显存。
@@ -129,6 +133,8 @@ def build_cmd(input_json, save_stem):
     ]
     if LORA_DIR:
         cmd += ["--lora_dir", LORA_DIR, "--lora_scale", str(LORA_SCALE)]
+    if USE_TEACACHE:
+        cmd += ["--use_teacache", "--teacache_thresh", str(TEACACHE_THRESH)]
     if T5_CPU:
         cmd += ["--t5_cpu"]
     if USE_FP8:
