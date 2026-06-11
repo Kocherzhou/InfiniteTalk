@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
 # 下载 InfiniteTalk 所需全部权重到 ./weights（~90G）。幂等：已下的会续传/跳过。
-# 国内平台：默认 HF_ENDPOINT=hf-mirror（快）。境外平台：可 export HF_ENDPOINT= 用官方源。
+# 全部走 HuggingFace + hf_transfer 加速：
+#   - 境外平台：设 HF_ENDPOINT=https://huggingface.co（官方源，几十 MB/s）。
+#   - 国内平台：保持默认 HF_ENDPOINT=https://hf-mirror.com（镜像站，同样快）。
+# 注：旧版 Wan2.1 走 ModelScope，在境外机房只有 ~60kB/s（ETA 数十小时），已弃用。
 set -euo pipefail
 cd /app
 export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
+export HF_HUB_ENABLE_HF_TRANSFER=1
 mkdir -p weights
 
-echo "[download] Wan2.1-I2V-14B-480P（~77G，走 ModelScope）..."
-modelscope download --model Wan-AI/Wan2.1-I2V-14B-480P --local_dir weights/Wan2.1-I2V-14B-480P
+echo "[download] Wan2.1-I2V-14B-480P（~77G，HuggingFace + hf_transfer）..."
+huggingface-cli download Wan-AI/Wan2.1-I2V-14B-480P --local-dir weights/Wan2.1-I2V-14B-480P
 
 echo "[download] chinese-wav2vec2-base ..."
 huggingface-cli download TencentGameMate/chinese-wav2vec2-base --local-dir weights/chinese-wav2vec2-base
