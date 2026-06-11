@@ -48,4 +48,8 @@ jobs:
         with:
           context: .
           push: true
-          tags: ghcr.io/kocherzhou/infinitetalk-worker:latest
+          # latest 会被各云主机的本地缓存坑（同 tag 不重拉 → 跑旧代码）。
+          # 每次构建多打一个唯一 tag（build-<run_number>），模板钉死它即可强制拉新。
+          tags: |
+            ghcr.io/kocherzhou/infinitetalk-worker:latest
+            ghcr.io/kocherzhou/infinitetalk-worker:build-${{ github.run_number }}
