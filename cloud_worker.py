@@ -72,7 +72,9 @@ NUM_PERSISTENT_PARAM_IN_DIT = None   # 24GB+ 用 None(最快)；OOM 再设整数
 # 在 48G 卡上慢 5-10 倍（曾实测 46s/step）。关掉它让 DiT 常驻显存。
 OFFLOAD_MODEL = False
 # T5 文本编码器放 CPU（只在开头编码一次提示词），给显存腾出 ~11G，配合 offload=False 防 OOM。
-T5_CPU       = True
+# 但放 CPU 会占 ~11G 系统内存——80G 显存的卡(H800)上长跑整首会把 96G RAM 撑爆(rc=-9 OOM)！
+# 这种卡设 T5_CPU=0 让 T5 进显存、腾出系统内存。48G 卡才需要 =1。
+T5_CPU       = os.environ.get("T5_CPU", "1") == "1"
 # ──────────────────────────────────────────────────────────────────────────────
 
 # httpx 客户端：trust_env=False 绕过 .env 的 socks 代理（家里/云端都避免误走代理）。
