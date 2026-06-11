@@ -21,6 +21,7 @@ cloud_worker.py — 拉取式云端 worker（跑在租的 GPU 上，例如 AutoD
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -100,7 +101,7 @@ def progress(cli, job_id, **kw):
 
 def post_result(cli, job_id, mp4_path=None, error=None):
     if error:
-        cli.post(f"{HOME_BASE_URL}/api/worker/result/{job_id}", data={"error": error[:300]})
+        cli.post(f"{HOME_BASE_URL}/api/worker/result/{job_id}", data={"error": error[:1500]})
         return
     with open(mp4_path, "rb") as f:
         cli.post(f"{HOME_BASE_URL}/api/worker/result/{job_id}",
@@ -137,8 +138,73 @@ def build_cmd(input_json, save_stem):
     return cmd
 
 
+_STEP_RE = re.compile(r"(\d+)\s*/\s*(\d+)")
+
+
+def _run_and_stream(cli, job_id, cmd, env):
+    """跑生成子进程，逐行解析输出，实时回报细粒度进度。返回 (returncode, full_log)。
+
+    解析 generate_infinitetalk.py 的 stdout/stderr（合并）里的标记：
+      - 'Creating ... pipeline' / 'loading ... weights' / 'WanModel' → 加载模型
+      - 'Generating video'                                          → 开始生成
+      - tqdm 步进度条 'x/N'（采样阶段，配 it/s|%||）                → 采样 第k段窗口 x/N 步
+      - 'decode' / 'vae'                                            → VAE 解码
+    tqdm 用 \\r 原地刷新，所以按 \\r 和 \\n 同时切行。
+    """
+    proc = subprocess.Popen(cmd, cwd=ROOT, env=env, text=True, bufsize=1,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    full, window, last_step, stage, last_post = [], 0, -1, "", 0.0
+
+    def emit(msg, prog, log=None):
+        progress(cli, job_id, status="generating", progress=prog, message=msg, log=log)
+
+    buf = ""
+    while True:
+        ch = proc.stdout.read(1)
+        if not ch:
+            break
+        if ch not in ("\r", "\n"):
+            buf += ch
+            continue
+        line, buf = buf.strip(), ""
+        if not line:
+            continue
+        full.append(line)
+        if len(full) > 400:
+            del full[:150]
+        low = line.lower()
+        now = time.time()
+        if stage in ("", "load") and (("creating" in low and "pipeline" in low)
+                or ("loading" in low and "weight" in low) or "wanmodel" in low):
+            if stage != "load":
+                stage = "load"
+                emit("加载模型中（读权重，约几分钟）…", 25, line)
+        elif "generating video" in low:
+            if stage != "gen":
+                stage = "gen"
+                emit("开始生成…", 30, line)
+        elif stage in ("gen", "sample") and ("decode" in low or "vae" in low):
+            if stage != "decode":
+                stage = "decode"
+                emit("VAE 解码中…", 90, line)
+        elif stage in ("gen", "sample"):
+            m = _STEP_RE.search(line)
+            if m and ("it/s" in low or "%" in line or "|" in line):
+                s, t = int(m.group(1)), int(m.group(2))
+                if 0 < t <= 100:                       # tqdm 采样条（~7/8 步），排除大数字
+                    if last_step < 0 or s < last_step:  # 步数回落 = 进入新窗口
+                        window += 1
+                    last_step = s
+                    stage = "sample"
+                    if now - last_post >= 4:
+                        emit(f"采样中 · 第 {window} 段窗口 · {s}/{t} 步", min(88, 32 + window * 2))
+                        last_post = now
+    proc.wait()
+    return proc.returncode, "\n".join(full)
+
+
 def run_infinitetalk(cli, job, img_path, aud_path):
-    """真生成：subprocess 跑 generate_infinitetalk.py → save_stem.mp4。"""
+    """真生成：subprocess 跑 generate_infinitetalk.py → save_stem.mp4（流式回报进度）。"""
     job_id = job["job_id"]
     save_stem = WORK_DIR / job_id
     input_json = WORK_DIR / f"{job_id}.json"
@@ -149,18 +215,18 @@ def run_infinitetalk(cli, job, img_path, aud_path):
     }, ensure_ascii=False), encoding="utf-8")
 
     progress(cli, job_id, status="generating", progress=20,
-             message="云端生成中（InfiniteTalk）…", log="开始 InfiniteTalk 推理")
+             message="启动生成进程…", log="开始 InfiniteTalk 推理")
     cmd = build_cmd(input_json, save_stem)
     # expandable_segments 整理显存碎片，避免全精度+LoRA 在 48G 卡上 VAE 解码时 OOM；
-    # OMP_NUM_THREADS 给 AutoDL 镜像的非法默认值兜底。
+    # OMP_NUM_THREADS 给 AutoDL 镜像的非法默认值兜底；PYTHONUNBUFFERED 保证输出实时不卡缓冲。
     gen_env = {**os.environ,
                "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
-               "OMP_NUM_THREADS": "8"}
-    proc = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, env=gen_env)
+               "OMP_NUM_THREADS": "8",
+               "PYTHONUNBUFFERED": "1"}
+    rc, log = _run_and_stream(cli, job_id, cmd, gen_env)
     out_mp4 = Path(f"{save_stem}.mp4")
-    if proc.returncode != 0 or not out_mp4.exists():
-        tail = (proc.stderr or proc.stdout or "")[-300:]
-        raise RuntimeError(f"generate_infinitetalk rc={proc.returncode}: {tail}")
+    if rc != 0 or not out_mp4.exists():
+        raise RuntimeError(f"generate_infinitetalk rc={rc}: {log[-1500:]}")
     return out_mp4
 
 
