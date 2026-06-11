@@ -13,11 +13,13 @@ ENV DEBIAN_FRONTEND=noninteractive \
     HF_ENDPOINT=https://hf-mirror.com
 
 # Python 3.12（匹配 flash-attn cp312 预编译轮子）+ ffmpeg(ffprobe) + git
+# 注：3.12 已从标准库移除 distutils，deadsnakes 不再提供 python3.12-distutils 包，
+#     装它会让 apt 报 exit 100；get-pip.py 自带 setuptools，无需 distutils。
 RUN apt-get update && apt-get install -y --no-install-recommends \
         software-properties-common ca-certificates curl git ffmpeg && \
     add-apt-repository -y ppa:deadsnakes/ppa && apt-get update && \
     apt-get install -y --no-install-recommends \
-        python3.12 python3.12-dev python3.12-distutils && \
+        python3.12 python3.12-dev && \
     curl -sS https://bootstrap.pypa.io/get-pip.py | python3.12 && \
     ln -sf /usr/bin/python3.12 /usr/local/bin/python && \
     ln -sf /usr/bin/python3.12 /usr/local/bin/python3 && \
