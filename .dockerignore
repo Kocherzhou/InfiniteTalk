@@ -1,0 +1,14 @@
+.git
+weights/
+_worker/
+save_audio/
+inbox/
+outbox/
+webapp/uploads/
+**/__pycache__/
+*.pyc
+*.mp4
+*.wav
+.env
+webapp/.env
+*.log
