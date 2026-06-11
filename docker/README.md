@@ -35,6 +35,21 @@ docker run -d --gpus all --name italk-worker \
   ghcr.io/kocherzhou/infinitetalk-worker:latest
 ```
 
+## 3.5 RunPod Secure Cloud 单卡试水（首选）
+现货最足、唯一同时满足「免登录拉 GHCR + 真·持久网络卷 + 只需出站」。
+1. 控制台 **Storage → Network Volume** 建一个 **100GB** 卷（$0.07/GB·月 ≈ $7/月），选一个有 A100/H100 现货的区域。
+2. **Deploy** 一台 **A100-80G**（$1.39/h PCIe）或 H100，附上刚建的卷。
+3. **Container Image** 填 `ghcr.io/kocherzhou/infinitetalk-worker:latest`（公开，免登录）。
+4. **环境变量**：
+   ```
+   HOME_BASE_URL=https://e.tangake.com:18444
+   WORKER_TOKEN=ace0f86faed71c8f699e8f559a37c65d
+   T5_CPU=1                      # 48-80G 都先用 1 稳妥
+   WEIGHTS_DIR=/workspace/weights # RunPod 卷默认挂 /workspace → 权重落持久卷
+   ```
+   （把网络卷的挂载路径保持默认 `/workspace` 即可；`WEIGHTS_DIR` 让 entrypoint 自动把 `/app/weights` 软链过去。）
+5. 首启自动下 ~90G 权重到卷里（一次），之后重开秒起。
+
 ## 4. 平台备忘
 - **境外（RunPod/Vast/Lambda）**：H100/H200 货多。下载权重慢的话 `-e HF_ENDPOINT=`（用官方源）。
 - **国内（恒源云/矩池云/潞晨云等）**：默认 hf-mirror 即可；支付/网络对家里服务器都友好。

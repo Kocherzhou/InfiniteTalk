@@ -1,7 +1,20 @@
 #!/usr/bin/env bash
-# 容器入口：首次自动下载权重到挂载卷 ./weights，然后起 worker。
+# 容器入口：首次自动下载权重到挂载卷，然后起 worker。
 set -euo pipefail
 cd /app
+
+# 权重目录适配任意平台的挂载点：默认 /app/weights；若平台把持久卷挂在别处
+# （RunPod 默认 /workspace、潞晨/AutoDL 各有约定），设 WEIGHTS_DIR 指过去即可，
+# entrypoint 会把 /app/weights 软链到它 —— 代码仍按 weights/ 相对路径找权重，
+# 实际落在持久卷里，关机不丢、重启秒起。
+WEIGHTS_DIR="${WEIGHTS_DIR:-/app/weights}"
+if [ "$WEIGHTS_DIR" != "/app/weights" ]; then
+  echo "[entrypoint] WEIGHTS_DIR=$WEIGHTS_DIR → 软链 /app/weights 过去（持久卷）"
+  mkdir -p "$WEIGHTS_DIR"
+  rm -rf /app/weights 2>/dev/null || true
+  ln -sfn "$WEIGHTS_DIR" /app/weights
+fi
+mkdir -p /app/weights
 
 WEIGHTS_MARK="weights/Wan2.1-I2V-14B-480P/config.json"
 if [ ! -f "$WEIGHTS_MARK" ]; then
