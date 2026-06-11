@@ -11,6 +11,10 @@ on:
       - docker/**
       - requirements.txt
       - cloud_worker.py
+      - generate_infinitetalk.py
+      - wan/**
+      - src/**
+      - kokoro/**
       - .github/workflows/build-worker-image.yml
 
 jobs:
