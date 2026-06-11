@@ -35,6 +35,9 @@ ROOT = Path(__file__).resolve().parent
 HOME_BASE_URL = os.environ.get("HOME_BASE_URL", "http://localhost:28600").rstrip("/")
 WORKER_TOKEN  = os.environ.get("WORKER_TOKEN", "")
 POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", "5"))
+# 多卡：NGPUS>1 时用 torchrun 起多进程 + xdit 序列并行(ulysses)。Wan-14B 40 头，
+# NGPUS 须能整除 40（1/2/4/5/8 都行）。LoRA 是先合进模型再 FSDP 分片，兼容 8 步加速。
+NGPUS = int(os.environ.get("NGPUS", "1"))
 
 WORK_DIR = ROOT / "_worker"
 WORK_DIR.mkdir(exist_ok=True)
@@ -114,8 +117,14 @@ def post_result(cli, job_id, mp4_path=None, error=None):
 
 
 def build_cmd(input_json, save_stem):
-    cmd = [
-        sys.executable, "generate_infinitetalk.py",
+    multi = NGPUS > 1
+    if multi:
+        # torchrun 单机多进程；--standalone 自带 rendezvous
+        cmd = ["torchrun", "--nproc_per_node", str(NGPUS), "--standalone",
+               "generate_infinitetalk.py"]
+    else:
+        cmd = [sys.executable, "generate_infinitetalk.py"]
+    cmd += [
         "--ckpt_dir", CKPT_DIR,
         "--wav2vec_dir", WAV2VEC_DIR,
         "--infinitetalk_dir", INFINITETALK,
@@ -128,19 +137,23 @@ def build_cmd(input_json, save_stem):
         "--sample_shift", str(SAMPLE_SHIFT),
         "--sample_text_guide_scale", str(TEXT_GUIDE),
         "--sample_audio_guide_scale", str(AUDIO_GUIDE),
-        "--offload_model", str(OFFLOAD_MODEL),   # False = DiT 常驻显存（48G 卡，快很多）
         "--save_file", str(save_stem),
     ]
     if LORA_DIR:
         cmd += ["--lora_dir", LORA_DIR, "--lora_scale", str(LORA_SCALE)]
     if USE_TEACACHE:
         cmd += ["--use_teacache", "--teacache_thresh", str(TEACACHE_THRESH)]
-    if T5_CPU:
-        cmd += ["--t5_cpu"]
+    if multi:
+        # 多卡：FSDP 分片 DiT/T5 + ulysses 序列并行；offload 由代码自动关，t5 用 fsdp 不用 cpu
+        cmd += ["--dit_fsdp", "--t5_fsdp", "--ulysses_size", str(NGPUS)]
+    else:
+        cmd += ["--offload_model", str(OFFLOAD_MODEL)]   # False = DiT 常驻显存（单卡快很多）
+        if T5_CPU:
+            cmd += ["--t5_cpu"]
+        if NUM_PERSISTENT_PARAM_IN_DIT is not None:
+            cmd += ["--num_persistent_param_in_dit", str(NUM_PERSISTENT_PARAM_IN_DIT)]
     if USE_FP8:
         cmd += ["--quant", "fp8", "--quant_dir", QUANT_DIR]
-    if NUM_PERSISTENT_PARAM_IN_DIT is not None:
-        cmd += ["--num_persistent_param_in_dit", str(NUM_PERSISTENT_PARAM_IN_DIT)]
     return cmd
 
 
@@ -275,7 +288,7 @@ def main():
     ap.add_argument("--once", action="store_true", help="只处理一个任务后退出（调试用）")
     args = ap.parse_args()
 
-    print(f"cloud_worker → {HOME_BASE_URL}  (mock={args.mock})")
+    print(f"cloud_worker → {HOME_BASE_URL}  (mock={args.mock}, NGPUS={NGPUS})")
     if not args.mock and not (ROOT / "generate_infinitetalk.py").exists():
         print("⚠ 找不到 generate_infinitetalk.py —— 请在 InfiniteTalk 仓库根目录运行（或加 --mock）")
     idle_notified = False
