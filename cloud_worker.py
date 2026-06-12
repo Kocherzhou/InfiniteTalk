@@ -67,7 +67,10 @@ AUDIO_GUIDE  = 2.0
 # thresh 越大越激进越快、质量风险越高；0.2 是 README 推荐的保守值。设 False 关闭。
 USE_TEACACHE   = True
 TEACACHE_THRESH = 0.2
-NUM_PERSISTENT_PARAM_IN_DIT = None   # 24GB+ 用 None(最快)；OOM 再设整数；极限设 0
+# DiT 常驻显存参数量上限：None=全常驻最快(需 >47G 可用)；OOM 再设整数；极限设 0。
+# 实测 vGPU-48G(可用 47.37G)全常驻会 OOM，设 11000000000(≈22G 常驻)稳；80G 卡留空走 None。
+_npp = os.environ.get("NUM_PERSISTENT_PARAM_IN_DIT", "").strip()
+NUM_PERSISTENT_PARAM_IN_DIT = int(_npp) if _npp else None
 # 关键速度开关：offload_model 默认 True 会每步把 DiT 卸到 CPU（给小显存卡用），
 # 在 48G 卡上慢 5-10 倍（曾实测 46s/step）。关掉它让 DiT 常驻显存。
 OFFLOAD_MODEL = False
