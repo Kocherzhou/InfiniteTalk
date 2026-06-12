@@ -11,6 +11,7 @@ import os
 import time
 import uuid
 import json
+import array
 import shutil
 import threading
 import subprocess
@@ -61,16 +62,51 @@ def _video_dims(path):
     return int(w), int(h)
 
 
-def split_audio_even(src, n, prefix):
-    """把 src 音频等分成 n 段 wav（16k 单声道，InfiniteTalk 友好）。返回 n 个路径。"""
+def _quietest_moment(src, center, win=4.0):
+    """在 center±win 秒内找能量最低的 0.3s 窗口中心（≈人声换气/句间空隙），返回绝对秒数。
+    解码 16k 单声道 PCM 后纯 Python 算滑窗能量，失败时退回 center。"""
+    start = max(0.0, center - win)
+    r = subprocess.run([FFMPEG, "-v", "error", "-ss", f"{start:.3f}", "-t", f"{2*win:.3f}",
+                        "-i", str(src), "-ac", "1", "-ar", "16000", "-f", "s16le", "-"],
+                       capture_output=True)
+    pcm = array.array("h")
+    pcm.frombytes(r.stdout[: len(r.stdout) // 2 * 2])
+    if len(pcm) < 16000:
+        return center
+    hop, span = 800, 4800                     # 50ms 步进、300ms 窗口 @16kHz
+    best_i, best_e = 0, float("inf")
+    for i in range(0, len(pcm) - span, hop):
+        e = sum(s * s for s in pcm[i:i + span])
+        if e < best_e:
+            best_e, best_i = e, i
+    return start + (best_i + span / 2) / 16000.0
+
+
+def smart_cut_points(src, n):
+    """整曲 n 段的下刀点列表（含 0 和结尾，共 n+1 个）。
+    刀口不机械等分：每个等分点在 ±4s 内吸附到最静处，避免切在字/长音中间。"""
     dur = _audio_duration(src)
     seg = dur / n
+    cuts = [0.0]
+    for i in range(1, n):
+        c = _quietest_moment(src, i * seg)
+        if c < cuts[-1] + seg * 0.4:          # 防回退/段过短，退回等分点
+            c = i * seg
+        cuts.append(c)
+    cuts.append(dur)
+    return cuts
+
+
+def split_audio_even(src, n, prefix):
+    """把 src 音频切成 n 段 wav（16k 单声道，InfiniteTalk 友好），刀口走 smart_cut_points。
+    返回 n 个路径。"""
+    cuts = smart_cut_points(src, n)
     paths = []
     for i in range(n):
         p = f"{prefix}_seg{i}.wav"
-        cmd = [FFMPEG, "-y", "-ss", f"{i*seg:.3f}", "-i", str(src)]
+        cmd = [FFMPEG, "-y", "-ss", f"{cuts[i]:.3f}", "-i", str(src)]
         if i < n - 1:
-            cmd += ["-t", f"{seg:.3f}"]          # 最后一段不限长，吃到结尾
+            cmd += ["-t", f"{cuts[i+1] - cuts[i]:.3f}"]   # 最后一段不限长，吃到结尾
         cmd += ["-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", p]
         r = subprocess.run(cmd, capture_output=True, text=True)
         if r.returncode != 0 or not os.path.exists(p):
