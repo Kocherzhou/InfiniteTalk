@@ -65,6 +65,21 @@ def flash_attention(
     # params
     b, lq, lk, out_dtype = q.size(0), q.size(1), k.size(1), q.dtype
 
+    if not (FLASH_ATTN_2_AVAILABLE or FLASH_ATTN_3_AVAILABLE):
+        # Blackwell(sm_120) 等装不上 flash_attn 的环境：整体退回 PyTorch SDPA。
+        # 与下方 attention() 的回退同口径：q_lens/k_lens 的 padding mask 被忽略（警告一次）。
+        if q_lens is not None or k_lens is not None:
+            warnings.warn(
+                'flash_attn unavailable, falling back to scaled_dot_product_attention; '
+                'padding mask is disabled, this may affect quality with padded batches.')
+        _h = lambda t: (t if t.dtype in half_dtypes else t.to(dtype))
+        q2, k2, v2 = _h(q).transpose(1, 2), _h(k).transpose(1, 2), _h(v).transpose(1, 2)
+        if q_scale is not None:
+            q2 = q2 * q_scale
+        out = torch.nn.functional.scaled_dot_product_attention(
+            q2, k2, v2, is_causal=causal, dropout_p=dropout_p, scale=softmax_scale)
+        return out.transpose(1, 2).contiguous().to(out_dtype)
+
     def half(x):
         return x if x.dtype in half_dtypes else x.to(dtype)
 
