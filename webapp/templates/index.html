@@ -196,6 +196,57 @@
     document.getElementById('dropImage').classList.add('filled');
   }
 
+  // ── 剪接预判：相邻图 dHash 感知差异 → 跳戏风险预警（30 度规则的廉价代理） ──
+  let imgHashes = [];   // 与 imgFiles 同序的 64bit dHash（字符串）
+  function fileDHash(file) {
+    return new Promise(resolve => {
+      const img = new Image();
+      img.onload = () => {
+        const c = document.createElement('canvas'); c.width = 9; c.height = 8;
+        const ctx = c.getContext('2d');
+        ctx.drawImage(img, 0, 0, 9, 8);
+        const px = ctx.getImageData(0, 0, 9, 8).data;
+        let bits = '';
+        for (let y = 0; y < 8; y++) for (let x = 0; x < 8; x++) {
+          const i = (y * 9 + x) * 4, j = i + 4;
+          const a = px[i] * .299 + px[i+1] * .587 + px[i+2] * .114;
+          const b = px[j] * .299 + px[j+1] * .587 + px[j+2] * .114;
+          bits += a > b ? '1' : '0';
+        }
+        URL.revokeObjectURL(img.src);
+        resolve(bits);
+      };
+      img.onerror = () => resolve(null);
+      img.src = URL.createObjectURL(file);
+    });
+  }
+  function hamming(a, b) {
+    let d = 0;
+    for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) d++;
+    return d;
+  }
+  function cutVerdict(d) {
+    if (d === null) return null;
+    if (d <= 12) return { icon: '🔴', color: '#f87171', text: `构图过近(差异 ${d}/64) — 跳戏风险高,建议这两张之间换景别或转 30°+ 角度` };
+    if (d <= 22) return { icon: '🟡', color: '#fbbf24', text: `偏相似(差异 ${d}/64) — 可接受,景别差再大些更稳` };
+    return { icon: '🟢', color: '#4ade80', text: `差异充分(差异 ${d}/64) — 剪接应当自然` };
+  }
+  async function updateTransitions() {
+    while (imgHashes.length < imgFiles.length) {
+      imgHashes.push(await fileDHash(imgFiles[imgHashes.length]));
+    }
+    for (let i = 0; i + 1 < imgFiles.length; i++) {
+      const el = document.getElementById(`cutHint${i}`);
+      if (!el) continue;
+      const a = imgHashes[i], b = imgHashes[i + 1];
+      const v = (a && b) ? cutVerdict(hamming(a, b)) : null;
+      if (v) {
+        el.style.color = v.color;
+        el.textContent = `${v.icon} ✂ ${i + 1}→${i + 2} 剪接预判:${v.text}`;
+      }
+    }
+  }
+
   // 多机位时为每张图渲染一条分镜提示词输入（缩略图 + textarea），值存 imgPrompts。
   function renderPerPrompts() {
     const field = document.getElementById('perPromptField');
@@ -203,16 +254,20 @@
     if (imgFiles.length < 2) { field.style.display = 'none'; list.innerHTML = ''; return; }
     field.style.display = 'block';
     list.innerHTML = imgFiles.map((f, i) =>
-      `<div style="display:flex;gap:10px;align-items:flex-start;margin-bottom:8px">
+      `<div style="display:flex;gap:10px;align-items:flex-start;margin-bottom:4px">
          <div style="position:relative;flex-shrink:0">
            <img style="width:64px;height:64px;object-fit:cover;border-radius:8px" src="${URL.createObjectURL(f)}">
            <span style="position:absolute;top:2px;left:2px;background:#000a;color:#fff;border-radius:4px;padding:0 5px;font-size:11px">${i + 1}</span>
          </div>
          <textarea data-idx="${i}" class="perPrompt" style="min-height:64px;font-size:12.5px"
            placeholder="机位 ${i + 1} 的镜头/情绪描述（留空用全局）">${imgPrompts[i] || ''}</textarea>
-       </div>`).join('');
+       </div>` +
+      (i + 1 < imgFiles.length
+        ? `<div id="cutHint${i}" style="margin:0 0 8px 74px;font-size:11.5px;color:var(--muted)">✂ ${i + 1}→${i + 2} 剪接预判分析中…</div>`
+        : '')).join('');
     list.querySelectorAll('.perPrompt').forEach(t =>
       t.addEventListener('input', () => { imgPrompts[+t.dataset.idx] = t.value; }));
+    updateTransitions();
   }
   (function () {
     const drop = document.getElementById('dropImage'), inp = document.getElementById('fileImage');
