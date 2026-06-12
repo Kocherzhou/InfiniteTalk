@@ -303,6 +303,11 @@ def api_create_mtv():
         os.replace(segs[i], str(capath))           # 段 wav 改名成子任务音频
         per = per_prompts[i] if i < len(per_prompts) else ""
         child_prompt = f"{per}, {prompt}" if per else prompt
+        # 剪接配套：边界动作归零，让相邻段切点两侧动作幅度收敛，减少跳变感
+        child_prompt += ", starting from a calm settled pose, gently settling back to a quiet rest pose at the end"
+        # 首段通常含前奏：压住无人声段的表演欲，等人声进来再开口
+        if i == 0:
+            child_prompt += ", during instrumental intro he listens quietly with mouth closed and subtle breathing, only begins singing when the vocals enter, restrained natural expression"
         child_jobs.append({
             "id": cid, "status": "queued", "progress": 0, "message": "排队中…",
             "prompt": child_prompt, "image_name": im.filename, "audio_name": f"第{i+1}段",
