@@ -272,6 +272,8 @@ def api_create_mtv():
         return jsonify({"error": "请上传音频"}), 400
 
     prompt = (request.form.get("prompt") or "").strip() or DEFAULT_PROMPT
+    # 逐张分镜提示词（与 images 同序；空串=回落全局 prompt）
+    per_prompts = [p.strip() for p in request.form.getlist("prompts")]
     n = len(images)
     parent_id = uuid.uuid4().hex
     apath = UPLOAD_DIR / f"{parent_id}_audio.{_ext(audio.filename, AUDIO_EXTS, 'wav')}"
@@ -297,9 +299,10 @@ def api_create_mtv():
         im.save(str(ipath))
         capath = UPLOAD_DIR / f"{cid}_audio.wav"
         os.replace(segs[i], str(capath))           # 段 wav 改名成子任务音频
+        child_prompt = per_prompts[i] if i < len(per_prompts) and per_prompts[i] else prompt
         child_jobs.append({
             "id": cid, "status": "queued", "progress": 0, "message": "排队中…",
-            "prompt": prompt, "image_name": im.filename, "audio_name": f"第{i+1}段",
+            "prompt": child_prompt, "image_name": im.filename, "audio_name": f"第{i+1}段",
             "logs": [], "created": t0 + i * 0.001,   # 保序：seg0 先被领
             "_image": str(ipath), "_audio": str(capath),
             "_parent": parent_id, "seg_index": i,

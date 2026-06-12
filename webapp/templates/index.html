@@ -127,6 +127,11 @@
       <textarea id="prompt" placeholder="A woman sings passionately into a microphone, close-up, warm studio lighting..."></textarea>
     </div>
 
+    <div class="field" id="perPromptField" style="display:none">
+      <label>分镜提示词（多机位时逐张生效；留空的镜位回落上面的全局提示词）</label>
+      <div id="perPromptList"></div>
+    </div>
+
     <button class="go" id="goBtn" disabled>🎬 开始生成对口型视频</button>
     <div class="note">提交后任务进入队列；请开启云端 GPU（AutoDL），worker 会自动接单生成。</div>
   </div>
@@ -158,7 +163,7 @@
 </div>
 
 <script>
-  let imgFiles = [], audFile = null, evt = null, curJob = null;
+  let imgFiles = [], imgPrompts = [], audFile = null, evt = null, curJob = null;
 
   function bindDrop(dropEl, inputEl, accept, onPick) {
     dropEl.addEventListener('click', () => inputEl.click());
@@ -171,8 +176,9 @@
 
   // 图片区：支持多选（多机位）。每次选/拖会"追加"，方便分多次挑图。
   function addImages(fileList) {
-    for (const f of fileList) if (f && f.type.startsWith('image/')) imgFiles.push(f);
+    for (const f of fileList) if (f && f.type.startsWith('image/')) { imgFiles.push(f); imgPrompts.push(''); }
     renderImages();
+    renderPerPrompts();
     refreshGo();
   }
   function renderImages() {
@@ -188,6 +194,25 @@
       `<div class="drop-title">🖼️ ${tip}</div><div>${thumbs}</div>
        <div class="drop-hint">再点可继续追加；清空请刷新页面</div>`;
     document.getElementById('dropImage').classList.add('filled');
+  }
+
+  // 多机位时为每张图渲染一条分镜提示词输入（缩略图 + textarea），值存 imgPrompts。
+  function renderPerPrompts() {
+    const field = document.getElementById('perPromptField');
+    const list = document.getElementById('perPromptList');
+    if (imgFiles.length < 2) { field.style.display = 'none'; list.innerHTML = ''; return; }
+    field.style.display = 'block';
+    list.innerHTML = imgFiles.map((f, i) =>
+      `<div style="display:flex;gap:10px;align-items:flex-start;margin-bottom:8px">
+         <div style="position:relative;flex-shrink:0">
+           <img style="width:64px;height:64px;object-fit:cover;border-radius:8px" src="${URL.createObjectURL(f)}">
+           <span style="position:absolute;top:2px;left:2px;background:#000a;color:#fff;border-radius:4px;padding:0 5px;font-size:11px">${i + 1}</span>
+         </div>
+         <textarea data-idx="${i}" class="perPrompt" style="min-height:64px;font-size:12.5px"
+           placeholder="机位 ${i + 1} 的镜头/情绪描述（留空用全局）">${imgPrompts[i] || ''}</textarea>
+       </div>`).join('');
+    list.querySelectorAll('.perPrompt').forEach(t =>
+      t.addEventListener('input', () => { imgPrompts[+t.dataset.idx] = t.value; }));
   }
   (function () {
     const drop = document.getElementById('dropImage'), inp = document.getElementById('fileImage');
@@ -222,7 +247,7 @@
     form.append('prompt', document.getElementById('prompt').value);
     let url;
     if (imgFiles.length > 1) {            // 多机位
-      imgFiles.forEach(f => form.append('images', f));
+      imgFiles.forEach((f, i) => { form.append('images', f); form.append('prompts', imgPrompts[i] || ''); });
       url = '/api/create_mtv';
     } else {                              // 单段
       form.append('image', imgFiles[0]);
