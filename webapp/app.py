@@ -8,6 +8,7 @@
 设计/脚手架风格沿用 ../video-subtitle (app.py 的 _auth_gate / jobs / SSE / add_log)。
 """
 import os
+import re
 import time
 import uuid
 import json
@@ -272,8 +273,9 @@ def api_create_mtv():
         return jsonify({"error": "请上传音频"}), 400
 
     prompt = (request.form.get("prompt") or "").strip() or DEFAULT_PROMPT
-    # 逐张分镜提示词（与 images 同序；空串=回落全局 prompt）
-    per_prompts = [p.strip() for p in request.form.getlist("prompts")]
+    # 逐张分镜提示词（与 images 同序）。非空=「分镜词, 全局基底」拼接；空=直接用全局。
+    # 容错：吃掉用户从对话里复制来的尾部「+ 基底」占位符。
+    per_prompts = [re.sub(r"[+＋]\s*基底\s*$", "", p.strip()).rstrip(" ,") for p in request.form.getlist("prompts")]
     n = len(images)
     parent_id = uuid.uuid4().hex
     apath = UPLOAD_DIR / f"{parent_id}_audio.{_ext(audio.filename, AUDIO_EXTS, 'wav')}"
@@ -299,7 +301,8 @@ def api_create_mtv():
         im.save(str(ipath))
         capath = UPLOAD_DIR / f"{cid}_audio.wav"
         os.replace(segs[i], str(capath))           # 段 wav 改名成子任务音频
-        child_prompt = per_prompts[i] if i < len(per_prompts) and per_prompts[i] else prompt
+        per = per_prompts[i] if i < len(per_prompts) else ""
+        child_prompt = f"{per}, {prompt}" if per else prompt
         child_jobs.append({
             "id": cid, "status": "queued", "progress": 0, "message": "排队中…",
             "prompt": child_prompt, "image_name": im.filename, "audio_name": f"第{i+1}段",
