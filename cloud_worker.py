@@ -298,14 +298,20 @@ def run_static(cli, job, img_path, aud_path):
     tw = (int(round(w * s)) // 2 * 2) or 2
     th = (int(round(h * s)) // 2 * 2) or 2
     frames = max(1, int(round(dur * 25)))
-    if os.environ.get("STATIC_ZOOM", "1") == "1":   # 缓慢推近(预放大4倍防抖)
-        vf = (f"scale={tw*4}:{th*4},zoompan=z='min(zoom+0.0004,1.12)':"
-              f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':"
-              f"d={frames}:fps=25:s={tw}x{th},setsar=1,format=yuv420p")
+    if os.environ.get("STATIC_ZOOM", "1") == "1":
+        # 连续缓慢推近:d=1+pzoom 逐帧累积(-loop 1 下唯一可靠写法);增量按时长摊到全段
+        # → 1.0→1.15 贯穿整段、肉眼可见但不晃(旧的 d=帧数+zoom 在 loop 下几乎不动)。
+        inc = round(0.15 / frames, 6)
+        vf = (f"scale={tw*2}:{th*2},zoompan=z='min(pzoom+{inc},1.15)':d=1:"
+              f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s={tw}x{th}:fps=25,"
+              f"setsar=1,format=yuv420p")
     else:
         vf = f"scale={tw}:{th},setsar=1,fps=25,format=yuv420p"
+    # loudnorm 对齐响度:InfiniteTalk 人物段输出 ≈-23 LUFS,空镜原始切片偏响 ~6dB,
+    # 不归一会在切到空镜时"音量跳高"(2026-06-13 实测)。I=-23 与人物段一致。
     cmd = ["ffmpeg", "-y", "-loop", "1", "-framerate", "25", "-t", f"{dur:.3f}",
            "-i", str(img_path), "-i", str(aud_path), "-vf", vf,
+           "-af", "loudnorm=I=-23:TP=-1.5:LRA=11",
            "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
            "-c:a", "aac", "-b:a", "192k", "-shortest", str(out_mp4)]
     proc = subprocess.run(cmd, capture_output=True, text=True)
