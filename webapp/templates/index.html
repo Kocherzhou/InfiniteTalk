@@ -89,6 +89,17 @@
     .dl-btn.primary { background:var(--accent-dk); color:#fff; border-color:var(--accent-dk); }
 
     .note { font-size:11.5px; color:var(--muted); margin-top:8px; }
+
+    /* 云机在线/失联状态条 */
+    .fleet { margin-top:10px; font-size:12.5px; padding:7px 11px; border-radius:9px;
+      background:var(--surface); border:1px solid var(--border); color:var(--muted); }
+    .fleet.on  { color:var(--success); border-color:#14532d; background:#08160c; }
+    .fleet.off { color:var(--warn-txt); border-color:var(--warn-bd); background:var(--warn-bg); }
+    /* 人声活动检测预警条（前奏/间奏注入提示） */
+    .vad-box { display:none; margin-top:12px; padding:9px 12px; border-radius:9px;
+      background:var(--warn-bg); border:1px solid var(--warn-bd); color:var(--warn-txt);
+      font-size:12.5px; line-height:1.65; }
+    .vad-box .vt { font-weight:600; margin-bottom:3px; }
   </style>
 </head>
 <body>
@@ -100,6 +111,8 @@
       <div class="header-sub">立绘 + 音频 → 对口型视频 · 云端 GPU 生成</div>
     </div>
   </header>
+
+  <div id="fleetBar" class="fleet" title="云端 GPU worker 轮询状态">☁ 云机状态检测中…</div>
 
   <!-- inputs -->
   <div id="inputArea">
@@ -128,7 +141,9 @@
     </div>
 
     <div class="field" id="perPromptField" style="display:none">
-      <label>分镜提示词（逐张生效，自动在末尾拼接上面的全局基底；留空=只用全局）</label>
+      <label>分镜提示词（逐张生效，自动在末尾拼接上面的全局基底；留空=只用全局）
+        <button type="button" id="autoArcBtn" style="margin-left:8px;font-size:12px;padding:3px 11px;border-radius:6px;border:1px solid var(--accent);background:transparent;color:var(--accent);cursor:pointer">✨ 一键铺情绪曲线</button>
+      </label>
       <div id="perPromptList"></div>
     </div>
 
@@ -146,6 +161,7 @@
     </div>
     <div class="bar-track"><div class="bar-fill" id="barFill"></div></div>
     <div class="progress-msg" id="progressMsg">准备中…</div>
+    <div id="vadBox" class="vad-box"></div>
     <div id="logBox">
       <div class="log-box-title">▶ 实时日志</div>
       <div id="logEntries"></div>
@@ -269,6 +285,39 @@
       t.addEventListener('input', () => { imgPrompts[+t.dataset.idx] = t.value; }));
     updateTransitions();
   }
+
+  // ── 一键铺情绪曲线：按图数 N 自动填每段「景别/角度 + 情绪」 ──────────────
+  // 景别轮换→相邻段不雷同(30度规则);情绪按 前奏→主歌收→递进→副歌放→桥段→结尾归静。
+  // 不写「动作归零」后缀与首段前奏静默——后端 create_mtv 会自动追加,避免重复。
+  function autoFillArc() {
+    const n = imgFiles.length;
+    if (n < 2) return;
+    if (imgPrompts.some(p => p && p.trim()) &&
+        !confirm('分镜框已有内容,确定用情绪曲线模板覆盖?')) return;
+    const FRAMING = [
+      'wide two-shot, both framed together facing forward',
+      'medium shot from a side angle, one singer slightly foreground',
+      'closer two-shot, leaning subtly toward each other with eye contact',
+      'close-up with shallow depth of field',
+      'two-shot at eye level, both singing together',
+      'intimate close two-shot, faces near, warm connection',
+      'side-angle shot near the instruments',
+      'frontal medium close-up, soft gaze'
+    ];
+    const emo = (i) => {
+      const p = n === 1 ? 0 : i / (n - 1);
+      if (i === 0) return 'calm and gentle, easing in';
+      if (i === n - 1) return 'warm, resolved and peaceful as the song closes';
+      if (p < 0.30) return 'warm restrained verse emotion, tender';
+      if (p < 0.50) return 'swelling pre-chorus feeling, building warmth';
+      if (p < 0.78) return 'lifted joyful chorus energy, brighter and singing out';
+      return 'heartfelt and reflective, softer intimate dynamics';
+    };
+    for (let i = 0; i < n; i++) imgPrompts[i] = `${FRAMING[i % FRAMING.length]}, ${emo(i)}`;
+    renderPerPrompts();
+  }
+  document.getElementById('autoArcBtn').addEventListener('click', autoFillArc);
+
   (function () {
     const drop = document.getElementById('dropImage'), inp = document.getElementById('fileImage');
     drop.addEventListener('click', () => inp.click());
@@ -313,6 +362,7 @@
       const d = await r.json();
       if (d.error) throw new Error(d.error);
       curJob = d.job_id;
+      localStorage.setItem('curJob', curJob);
       document.getElementById('inputArea').style.display = 'none';
       document.getElementById('progressCard').style.display = 'block';
       listen(d.job_id);
@@ -322,15 +372,23 @@
     }
   });
 
+  let watching = false;
   function listen(jobId) {
     if (evt) evt.close();
+    watching = true;
     evt = new EventSource(`/api/status/${jobId}`);
     evt.onmessage = e => {
       const d = JSON.parse(e.data);
       apply(d);
-      if (['completed', 'error'].includes(d.status)) evt.close();
+      if (['completed', 'error'].includes(d.status)) {
+        watching = false; evt.close(); localStorage.removeItem('curJob');
+      }
     };
-    evt.onerror = () => evt.close();
+    // 断线(服务重启/网络抖动)不再直接放弃,3 秒后自动重连续上显示
+    evt.onerror = () => {
+      evt.close();
+      if (watching) setTimeout(() => { if (watching) listen(jobId); }, 3000);
+    };
   }
 
   function setStep(id, state) {
@@ -345,6 +403,13 @@
     const msg = document.getElementById('progressMsg');
     msg.textContent = d.message || '';
     msg.className = 'progress-msg' + (d.status === 'error' ? ' error' : '');
+
+    const vb = document.getElementById('vadBox');
+    if (d.vad && d.vad.length) {
+      vb.style.display = 'block';
+      vb.innerHTML = '<div class="vt">🎚 人声活动检测（已自动为这些段注入提示词）</div>' +
+        d.vad.map(x => `<div>${x}</div>`).join('');
+    }
 
     const s = d.status;
     setStep('s-up', 'done');
@@ -377,7 +442,35 @@
     card.scrollIntoView({ behavior: 'smooth' });
   }
 
-  document.getElementById('newBtn').addEventListener('click', () => location.reload());
+  document.getElementById('newBtn').addEventListener('click', () => { localStorage.removeItem('curJob'); location.reload(); });
+
+  // ── 云机在线/失联轮询：用户最常踩的坑=忘开 worker，活在队列干等。每 5s 刷新状态条 ──
+  async function pollFleet() {
+    try {
+      const d = await (await fetch('/api/fleet')).json();
+      const el = document.getElementById('fleetBar');
+      const extra = (d.queued || d.running) ? ` · 队列 ${d.queued} 排队/${d.running} 生成中` : '';
+      if (d.online > 0) {
+        el.className = 'fleet on';
+        el.textContent = `☁ 云机在线 ${d.online} 台 · 最近 ${d.last_seen_ago ?? 0}s 前轮询${extra}`;
+      } else {
+        el.className = 'fleet off';
+        const seen = d.last_seen_ago == null ? '从未连接' : `最近 ${d.last_seen_ago}s 前`;
+        el.textContent = `☁ 云机未连接（${seen}）— 请开启 AutoDL 并启动 worker${extra}`;
+      }
+    } catch (e) { /* 服务重启瞬间，静默跳过 */ }
+  }
+  setInterval(pollFleet, 5000); pollFleet();
+
+  // 刷新或重开页面后,自动恢复正在追踪的任务(已完成则直接显示结果视频)——根治"前端卡住"
+  (function restoreJob() {
+    const j = localStorage.getItem('curJob');
+    if (!j) return;
+    curJob = j;
+    document.getElementById('inputArea').style.display = 'none';
+    document.getElementById('progressCard').style.display = 'block';
+    listen(j);
+  })();
 </script>
 </body>
 </html>

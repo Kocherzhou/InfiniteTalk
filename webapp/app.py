@@ -45,6 +45,22 @@ AUDIO_EXTS = ("wav", "mp3", "m4a", "flac", "aac", "ogg")
 FFMPEG  = shutil.which("ffmpeg")  or "/home/kocher/miniconda3/bin/ffmpeg"
 FFPROBE = shutil.which("ffprobe") or "/home/kocher/miniconda3/bin/ffprobe"
 
+# 拼接交叉淡化：相邻机位切换处视频做 N 帧 xfade + 音频同步 acrossfade（=0 走老硬切）。
+# 刀口本就吸附到最静的换气处，音频淡化落在近无声区间，听感几乎无损；代价=整片比原曲短 N/25×(段数-1) 秒。
+XFADE_FRAMES = int(os.environ.get("XFADE_FRAMES", "10"))   # 0=硬切（保留旧行为）
+XFADE_FPS    = 25
+
+# 人声活动检测（纯能量启发式，无 torch）：识别低能量的前奏/间奏 → 自动注入「安静聆听」提示词。
+# 偏保守（宁漏不误）：只可靠识别 安静/近无声 段；响亮的纯器乐间奏未必识别，但绝不会误伤正常歌唱段。
+VAD_QUIET_FRAC = float(os.environ.get("VAD_QUIET_FRAC", "0.06"))  # 帧能量 < 全曲 P90×此值 = 静
+VAD_INTRO_MIN  = float(os.environ.get("VAD_INTRO_MIN",  "1.6"))   # 段首连续静 ≥ 此秒数 = 有前奏/间奏
+VAD_INST_RATIO = float(os.environ.get("VAD_INST_RATIO", "0.65"))  # 整段静占比 ≥ 此值 = 基本无人声
+
+# 云端 worker 在线/失联 + 异构调度
+WORKER_ONLINE_SEC = int(os.environ.get("WORKER_ONLINE_SEC", "25"))   # 多久没轮询 = 失联（UI 用）
+WORKER_ACTIVE_SEC = int(os.environ.get("WORKER_ACTIVE_SEC", "600"))  # 多久内算「在场」（调度用，覆盖一次生成）
+FAST_RATIO        = float(os.environ.get("FAST_RATIO", "0.6"))       # 速度 ≥ 最快×此值 = 快卡
+
 
 # ── 多机位 MTV 辅助：切歌 + 拼接（都在家里端用 ffmpeg） ───────────────────────
 def _audio_duration(path):
@@ -98,10 +114,10 @@ def smart_cut_points(src, n):
     return cuts
 
 
-def split_audio_even(src, n, prefix):
-    """把 src 音频切成 n 段 wav（16k 单声道，InfiniteTalk 友好），刀口走 smart_cut_points。
-    返回 n 个路径。"""
-    cuts = smart_cut_points(src, n)
+def split_audio_at(src, cuts, prefix):
+    """按给定刀口 cuts（含 0 和结尾）把 src 切成 len(cuts)-1 段 wav（16k 单声道，
+    InfiniteTalk 友好）。返回各段路径。刀口由 smart_cut_points 算好，与 VAD 复用同一份。"""
+    n = len(cuts) - 1
     paths = []
     for i in range(n):
         p = f"{prefix}_seg{i}.wav"
@@ -116,19 +132,63 @@ def split_audio_even(src, n, prefix):
     return paths
 
 
-def stitch_clips(clip_paths, out_path):
-    """按序把多段 mp4 拼成一片：统一缩放+补边到第一段的尺寸，硬切（=机位切换）。"""
-    if not clip_paths:
-        raise RuntimeError("没有可拼接的片段")
-    if len(clip_paths) == 1:
-        shutil.copyfile(clip_paths[0], out_path)
-        return
+def vocal_activity_profile(src, cuts):
+    """整曲解码一次（16k 单声道），按 50ms 帧算能量，阈值取全曲 P90×VAD_QUIET_FRAC。
+    按 cuts 切片，每段返回 {leading_quiet, quiet_ratio}（秒 / 占比）。
+    纯能量启发式：可靠识别 安静/近无声 的前奏/间奏；响亮纯器乐段未必识别（偏保守，宁漏不误）。"""
+    n = len(cuts) - 1
+    blank = [{"leading_quiet": 0.0, "quiet_ratio": 0.0} for _ in range(n)]
+    try:
+        r = subprocess.run([FFMPEG, "-v", "error", "-i", str(src),
+                            "-ac", "1", "-ar", "16000", "-f", "s16le", "-"],
+                           capture_output=True)
+        pcm = array.array("h")
+        pcm.frombytes(r.stdout[: len(r.stdout) // 2 * 2])
+    except Exception:
+        return blank
+    FRAME = 800                                   # 50ms @16k
+    nf = len(pcm) // FRAME
+    if nf < 4:
+        return blank
+    energies = [sum(s * s for s in pcm[i * FRAME:(i + 1) * FRAME]) / FRAME for i in range(nf)]
+    p90 = sorted(energies)[min(nf - 1, int(nf * 0.90))]
+    thr = max(1.0, p90 * VAD_QUIET_FRAC)
+    out = []
+    for s in range(n):
+        f0, f1 = min(nf, int(cuts[s] / 0.05)), min(nf, int(cuts[s + 1] / 0.05))
+        fr = energies[f0:f1] or [p90]
+        lead = 0
+        for e in fr:
+            if e < thr:
+                lead += 1
+            else:
+                break
+        quiet = sum(1 for e in fr if e < thr)
+        out.append({"leading_quiet": lead * 0.05, "quiet_ratio": quiet / len(fr)})
+    return out
+
+
+def _media_duration(path):
+    out = subprocess.run([FFPROBE, "-v", "error", "-show_entries", "format=duration",
+                          "-of", "default=nw=1:nk=1", str(path)],
+                         capture_output=True, text=True).stdout.strip()
+    return float(out)
+
+
+def _norm_v(i, W, H):
+    """把第 i 路视频统一到 W×H / 25fps / yuv420p / sar1，xfade 要求各路完全一致。"""
+    return (f"[{i}:v]scale={W}:{H}:force_original_aspect_ratio=decrease,"
+            f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={XFADE_FPS},"
+            f"format=yuv420p,setpts=PTS-STARTPTS[v{i}]")
+
+
+def _stitch_hardcut(clip_paths, out_path):
+    """老路线：统一缩放+补边到第一段尺寸，concat 硬切（=机位瞬切）。"""
     W, H = _video_dims(clip_paths[0])
     inputs, filt = [], []
     for i, c in enumerate(clip_paths):
         inputs += ["-i", str(c)]
-        filt.append(f"[{i}:v]scale={W}:{H}:force_original_aspect_ratio=decrease,"
-                    f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=25[v{i}]")
+        filt.append(_norm_v(i, W, H))
     concat_in = "".join(f"[v{i}][{i}:a]" for i in range(len(clip_paths)))
     filt.append(f"{concat_in}concat=n={len(clip_paths)}:v=1:a=1[v][a]")
     cmd = [FFMPEG, "-y", *inputs, "-filter_complex", ";".join(filt),
@@ -138,10 +198,121 @@ def stitch_clips(clip_paths, out_path):
     if r.returncode != 0 or not os.path.exists(out_path):
         raise RuntimeError(f"ffmpeg 拼接失败: {(r.stderr or '')[-200:]}")
 
+
+def _stitch_xfade(clip_paths, out_path, dur):
+    """机位切换处做 dur 秒视频 xfade + 同步音频 acrossfade。
+    视频与音频淡化等长 → 整体等量缩短、A/V 始终同步（每段视频时长≈其音频时长）。
+    刀口已吸附最静换气处，音频交叉淡化落在近无声区间，听感几乎无损。"""
+    W, H = _video_dims(clip_paths[0])
+    durs = [_media_duration(c) for c in clip_paths]
+    d = min([dur] + [x * 0.45 for x in durs])     # 淡化时长须 < 任一段一半，防越界
+    if d <= 0.02:
+        raise RuntimeError("片段过短，无法交叉淡化")
+    inputs, filt = [], []
+    for i, c in enumerate(clip_paths):
+        inputs += ["-i", str(c)]
+        filt.append(_norm_v(i, W, H))
+        filt.append(f"[{i}:a]aformat=sample_rates=48000:channel_layouts=stereo,"
+                    f"asetpts=PTS-STARTPTS[a{i}]")
+    last = len(clip_paths) - 1
+    prev, off = "v0", durs[0] - d                 # offset = 累计时长 - 已用淡化
+    for i in range(1, len(clip_paths)):
+        tag = "vout" if i == last else f"vx{i}"
+        filt.append(f"[{prev}][v{i}]xfade=transition=fade:duration={d:.3f}:"
+                    f"offset={off:.3f}[{tag}]")
+        prev, off = tag, off + durs[i] - d
+    prevA = "a0"
+    for i in range(1, len(clip_paths)):
+        tag = "aout" if i == last else f"ax{i}"
+        filt.append(f"[{prevA}][a{i}]acrossfade=d={d:.3f}[{tag}]")
+        prevA = tag
+    cmd = [FFMPEG, "-y", *inputs, "-filter_complex", ";".join(filt),
+           "-map", "[vout]", "-map", "[aout]", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+           "-c:a", "aac", str(out_path)]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0 or not os.path.exists(out_path):
+        raise RuntimeError(f"xfade 拼接失败: {(r.stderr or '')[-300:]}")
+
+
+def stitch_clips(clip_paths, out_path):
+    """按序把多段 mp4 拼成一片。XFADE_FRAMES>0 走交叉淡化（失败自动回退硬切），=0 硬切。"""
+    if not clip_paths:
+        raise RuntimeError("没有可拼接的片段")
+    if len(clip_paths) == 1:
+        shutil.copyfile(clip_paths[0], out_path)
+        return
+    if XFADE_FRAMES > 0:
+        try:
+            _stitch_xfade(clip_paths, out_path, XFADE_FRAMES / XFADE_FPS)
+            return
+        except Exception as e:
+            print(f"⚠ xfade 拼接失败，回退硬切：{e}")
+    _stitch_hardcut(clip_paths, out_path)
+
 app = Flask(__name__)
 
 jobs = {}                 # job_id -> dict
-_lock = threading.Lock()
+_lock = threading.RLock()  # 可重入:存盘时可在持锁状态下再取锁做快照
+
+# ── 任务落盘持久化(家里重启不丢整轮)+ 被领超时重领 ───────────────────────────
+STATE_FILE = BASE / "jobs_state.json"
+# 被领走却长时间无进展(worker 崩/网络假死)→ 退回队列让别的卡重领。
+# 阈值要 > 单段最长无进展间隔:加载模型阶段约 9 分钟只报一次,故默认 15 分钟。
+STALE_CLAIM_SEC = int(os.environ.get("STALE_CLAIM_SEC", "900"))
+_save_lock = threading.Lock()
+
+
+def save_jobs():
+    """原子写盘:jobs → STATE_FILE(temp+rename)。任务就几个,频繁调用也廉价。"""
+    with _save_lock:
+        try:
+            with _lock:
+                payload = json.dumps(jobs, ensure_ascii=False)
+            tmp = STATE_FILE.with_suffix(".json.tmp")
+            tmp.write_text(payload, encoding="utf-8")
+            os.replace(tmp, STATE_FILE)
+        except Exception as e:
+            print(f"⚠ save_jobs 失败: {e}")
+
+
+def load_jobs():
+    """启动时从盘恢复任务。未完成任务保留状态(云端 worker 回报会续上),
+    并给它们的 _updated 续命,避免一启动就被超时重领;在拼接中的父任务重新触发拼接。"""
+    if not STATE_FILE.exists():
+        return
+    try:
+        data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    except Exception as e:
+        print(f"⚠ load_jobs 失败(忽略,从空开始): {e}")
+        return
+    now = time.time()
+    for jid, job in data.items():
+        if job.get("status") not in ("completed", "error"):
+            job["_updated"] = now
+        jobs[jid] = job
+    alive = sum(1 for j in jobs.values() if j.get("status") not in ("completed", "error"))
+    print(f"♻ 已从盘恢复 {len(jobs)} 个任务(未完成 {alive} 个)")
+    for jid, job in list(jobs.items()):
+        if job.get("kind") == "mtv" and job.get("status") == "stitching":
+            threading.Thread(target=_do_stitch, args=(jid,), daemon=True).start()
+
+
+def _requeue_stale_loop():
+    """看门狗:被领走却 STALE_CLAIM_SEC 内无进展的段 → 退回 queued 等重领。"""
+    while True:
+        time.sleep(30)
+        now, changed = time.time(), False
+        with _lock:
+            for job in jobs.values():
+                if job.get("status") in ("claimed", "generating", "uploading") \
+                        and now - job.get("_updated", now) > STALE_CLAIM_SEC:
+                    job["status"] = "queued"
+                    job["progress"] = 0
+                    job["message"] = "云端 worker 失联,已退回队列等待重领…"
+                    add_log(job, f"被领后 {STALE_CLAIM_SEC}s 无进展,自动退回队列重领", "error")
+                    changed = True
+        if changed:
+            save_jobs()
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -164,6 +335,34 @@ def _ext(filename, exts, default):
     return e if e in exts else default
 
 
+# ── 云端 worker 心跳：每次 /api/worker/* 接触即记 last-seen（失联标记 + 异构调度） ──
+# worker 暂未上报身份/速度时，按来源 IP 区分、速度记为 None（隧道后多 worker 同 IP 会并成一个，
+# 属已知局限，UI 仍能正确显示「在线/失联」）；待 worker 加 X-Worker-Id / X-Worker-Speed 后自动生效。
+_workers = {}                       # worker_id -> {"last": ts, "speed": float|None}
+_workers_lock = threading.Lock()
+
+
+def _touch_worker(speed=None):
+    wid = request.headers.get("X-Worker-Id") or request.remote_addr or "unknown"
+    with _workers_lock:
+        w = _workers.get(wid) or {}
+        w["last"] = time.time()
+        if speed is not None:
+            w["speed"] = speed
+        _workers[wid] = w
+    return wid
+
+
+def _fleet_snapshot():
+    """返回 (online, active, last_ts)：online=近 WORKER_ONLINE_SEC 在轮询，active=近 WORKER_ACTIVE_SEC 在场。"""
+    now = time.time()
+    with _workers_lock:
+        online = [(k, v) for k, v in _workers.items() if now - v["last"] < WORKER_ONLINE_SEC]
+        active = [(k, v) for k, v in _workers.items() if now - v["last"] < WORKER_ACTIVE_SEC]
+        last = max((v["last"] for v in _workers.values()), default=0.0)
+    return online, active, last
+
+
 # ── auth gate (clone of video-subtitle app.py:_auth_gate, + worker token) ──────
 @app.before_request
 def _auth_gate():
@@ -172,6 +371,11 @@ def _auth_gate():
     if path.startswith("/api/worker/"):
         if WORKER_TOKEN and request.headers.get("X-Worker-Token", "") != WORKER_TOKEN:
             return jsonify({"error": "bad worker token"}), 401
+        sp = request.headers.get("X-Worker-Speed")          # 心跳：记 last-seen(+速度)
+        try:
+            _touch_worker(float(sp) if sp else None)
+        except (TypeError, ValueError):
+            _touch_worker(None)
         return
     if not AUTH_TOKEN:
         return
@@ -258,6 +462,7 @@ def api_create():
     add_log(job, "已上传，进入队列")
     with _lock:
         jobs[job_id] = job
+    save_jobs()
     return jsonify({"job_id": job_id})
 
 
@@ -282,7 +487,9 @@ def api_create_mtv():
     audio.save(str(apath))
 
     try:
-        segs = split_audio_even(str(apath), n, str(UPLOAD_DIR / parent_id))
+        cuts = smart_cut_points(str(apath), n)                  # 智能刀口（吸附最静换气处）
+        vad = vocal_activity_profile(str(apath), cuts)          # 复用同一刀口做人声活动检测
+        segs = split_audio_at(str(apath), cuts, str(UPLOAD_DIR / parent_id))
     except Exception as e:
         return jsonify({"error": f"切歌失败：{str(e)[:150]}"}), 500
 
@@ -291,6 +498,7 @@ def api_create_mtv():
         "id": parent_id, "kind": "mtv", "status": "mtv_running", "progress": 3,
         "message": f"已切成 {n} 段，{n} 个子任务排队中，等待云端逐段生成…",
         "prompt": prompt, "logs": [], "created": t0, "n": n, "children": [],
+        "vad": [],                                   # 人声活动检测预警（前奏/间奏注入提示）
     }
     add_log(parent, f"切歌完成（{n} 段），开始排队")
 
@@ -305,9 +513,21 @@ def api_create_mtv():
         child_prompt = f"{per}, {prompt}" if per else prompt
         # 剪接配套：边界动作归零，让相邻段切点两侧动作幅度收敛，减少跳变感
         child_prompt += ", starting from a calm settled pose, gently settling back to a quiet rest pose at the end"
-        # 首段通常含前奏：压住无人声段的表演欲，等人声进来再开口
-        if i == 0:
-            child_prompt += ", during instrumental intro he listens quietly with mouth closed and subtle breathing, only begins singing when the vocals enter, restrained natural expression"
+        # 人声活动检测：低能量的前奏/间奏段 → 注入「安静聆听」抑制表演欲（取代旧的「假设前奏在段1」硬编码）
+        prof = vad[i] if i < len(vad) else None
+        if prof and prof["quiet_ratio"] >= VAD_INST_RATIO:
+            child_prompt += (", this passage is an instrumental section with little or no singing; "
+                             "he stays quiet and natural with mouth mostly closed, gently feeling the "
+                             "music instead of singing")
+            note = f"🟡 第{i+1}段：整体低能量（疑似器乐/间奏 {int(prof['quiet_ratio']*100)}%），已注入「间奏不开口」"
+            parent["vad"].append(note); add_log(parent, note)
+        elif prof and prof["leading_quiet"] >= VAD_INTRO_MIN:
+            sec = prof["leading_quiet"]
+            child_prompt += (f", during the quiet instrumental opening (about {sec:.0f} seconds) he listens "
+                             "calmly with mouth closed and subtle breathing, only begins singing when the "
+                             "vocals enter, restrained natural expression")
+            note = f"🟡 第{i+1}段：开头约 {sec:.1f}s 低能量（疑似前奏/间奏），已注入「等人声再开口」"
+            parent["vad"].append(note); add_log(parent, note)
         child_jobs.append({
             "id": cid, "status": "queued", "progress": 0, "message": "排队中…",
             "prompt": child_prompt, "image_name": im.filename, "audio_name": f"第{i+1}段",
@@ -321,6 +541,7 @@ def api_create_mtv():
         jobs[parent_id] = parent
         for c in child_jobs:
             jobs[c["id"]] = c
+    save_jobs()
     return jsonify({"job_id": parent_id})
 
 
@@ -363,6 +584,7 @@ def _do_stitch(pid):
         parent["status"] = "error"
         parent["message"] = f"拼接失败：{str(e)[:120]}（子片段可单独下载）"
         add_log(parent, parent["message"], "error")
+    save_jobs()
 
 
 @app.route("/api/status/<job_id>")
@@ -392,22 +614,54 @@ def api_result(job_id):
                      download_name=f"digitalhuman_{job_id}.mp4")
 
 
+@app.route("/api/fleet")
+def api_fleet():
+    """云机在线/失联 + 队列概览，供前端轮询显示（用户最常踩的坑=忘了开 worker，活在队列干等）。"""
+    online, active, last = _fleet_snapshot()
+    now = time.time()
+    with _lock:
+        queued  = sum(1 for j in jobs.values() if j["status"] == "queued")
+        running = sum(1 for j in jobs.values() if j["status"] in ("claimed", "generating", "uploading"))
+    return jsonify({
+        "online": len(online), "active": len(active),
+        "last_seen_ago": int(now - last) if last else None,
+        "queued": queued, "running": running,
+    })
+
+
 # ── worker pull API (X-Worker-Token; exempt from cookie gate) ──────────────────
 @app.route("/api/worker/claim", methods=["POST"])
 def worker_claim():
+    sp = request.headers.get("X-Worker-Speed")
+    try:
+        my_speed = float(sp) if sp else None
+    except ValueError:
+        my_speed = None
     with _lock:
-        for job in sorted(jobs.values(), key=lambda j: j["created"]):
-            if job["status"] == "queued":
-                job["status"] = "claimed"
-                job["progress"] = 5
-                job["message"] = "云端已接单，准备中…"
-                add_log(job, "云端 worker 已接单")
-                return jsonify({
-                    "job_id": job["id"],
-                    "prompt": job["prompt"],
-                    "image_ext": Path(job["_image"]).suffix.lstrip("."),
-                    "audio_ext": Path(job["_audio"]).suffix.lstrip("."),
-                })
+        queued = [j for j in jobs.values() if j["status"] == "queued"]
+        # 异构调度（best-effort）：剩余段数 ≤ 在场快卡数 时，把活留给快卡，别让慢卡领走拖墙钟。
+        # 仅当本卡已知速度且明显偏慢、且确有快卡在场时才让它稍等；无速度上报时退化为纯 FIFO（行为不变）。
+        if my_speed is not None and queued:
+            _, active, _ = _fleet_snapshot()
+            speeds = [v["speed"] for _, v in active if v.get("speed")]
+            if speeds:
+                best = max(speeds)
+                fast = [s for s in speeds if s >= FAST_RATIO * best]
+                if my_speed < FAST_RATIO * best and len(queued) <= len(fast):
+                    return ("", 204)          # 慢卡稍等：尾段留给快卡
+        for job in sorted(queued, key=lambda j: j["created"]):
+            job["status"] = "claimed"
+            job["progress"] = 5
+            job["message"] = "云端已接单，准备中…"
+            job["_updated"] = time.time()
+            add_log(job, "云端 worker 已接单")
+            save_jobs()
+            return jsonify({
+                "job_id": job["id"],
+                "prompt": job["prompt"],
+                "image_ext": Path(job["_image"]).suffix.lstrip("."),
+                "audio_ext": Path(job["_audio"]).suffix.lstrip("."),
+            })
     return ("", 204)
 
 
@@ -431,6 +685,7 @@ def worker_progress(job_id):
     for k in ("status", "progress", "message"):
         if k in d and d[k] is not None:
             job[k] = d[k]
+    job["_updated"] = time.time()
     if d.get("log"):
         add_log(job, str(d["log"]), d.get("log_type", "info"))
     # 子任务进度时，顺带刷新父任务的"第 k/N 段生成中"提示
@@ -438,6 +693,7 @@ def worker_progress(job_id):
     parent = jobs.get(pid) if pid else None
     if parent and parent.get("status") == "mtv_running":
         parent["message"] = f"第 {job.get('seg_index', 0) + 1}/{parent['n']} 段云端生成中…"
+    save_jobs()
     return jsonify({"ok": True})
 
 
@@ -452,6 +708,7 @@ def worker_result(job_id):
         job["message"] = f"云端生成失败：{err}"
         add_log(job, job["message"], "error")
         _finalize_parent(job)
+        save_jobs()
         return jsonify({"ok": True})
     f = request.files.get("video")
     if not f:
@@ -463,6 +720,7 @@ def worker_result(job_id):
     job["message"] = "生成完成 ✓"
     add_log(job, "成品已回传", "success")
     _finalize_parent(job)
+    save_jobs()
     return jsonify({"ok": True})
 
 
@@ -470,4 +728,7 @@ if __name__ == "__main__":
     print(f"🎤 数字人 MTV 工作台 starting on http://0.0.0.0:{PORT}")
     print(f"   AUTH_TOKEN:   {'✓ 已设置' if AUTH_TOKEN else '✗ 未设置(无登录)'}")
     print(f"   WORKER_TOKEN: {'✓ 已设置' if WORKER_TOKEN else '✗ 未设置(worker 无鉴权)'}")
+    load_jobs()                                  # 重启恢复:内存队列不再因重启清空
+    threading.Thread(target=_requeue_stale_loop, daemon=True).start()  # 被领超时重领看门狗
+    print(f"   持久化: {STATE_FILE.name} | 超时重领: {STALE_CLAIM_SEC}s")
     app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)
