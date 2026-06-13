@@ -18,3 +18,5 @@ outbox/
 out/
 webapp/uploads/
 webapp/webapp.log
+webapp/jobs_state.json
+webapp/jobs_state.json.tmp
