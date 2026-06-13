@@ -107,6 +107,36 @@ python mv/run_wavespeed.py \
 
 ---
 
+## 三·补充：低显存自建实战记录（10GB/RTX 3080）
+
+> 在 RTX 3080 10GB + WSL2 上实测自建**原版** InfiniteTalk 的全过程结论。**核心教训：显存 ≤16GB 不要硬刚原版仓库，直接上 Wan2GP。**
+
+### ✅ 最终推荐：低显存就用 Wan2GP（官方 Community Works 推荐）
+[Wan2GP](https://github.com/deepbeepmeep/Wan2GP) 专为"GPU-Poor"优化，6-12GB 显存即可跑 InfiniteTalk，把下面所有坑都自动堵上：
+- **1-click 安装器**自动配齐加速内核（Triton / Sage / Flash / GGUF / **Lightx2v** / Nunchaku），免去手动版本地狱；
+- 30 系吃 **Sage2 注意力**（最高 ~2× 提速）+ **int8 量化** + **Lightx2v 4 步蒸馏**（内置）；
+- 智能 **VRAM Profile**（自动块交换），10GB 选"低显存档"；
+- **Gradio 网页 UI**，反复做 MV 更顺手；
+- 建议**原生 Windows 跑**（拿满系统内存，绕开 WSL 内存上限）。
+
+### ⚠️ 原版仓库在 10GB 上的坑（已逐个踩过）
+1. **模型装不下→搬运慢**：14B 模型 fp8 也要 ~14GB > 10GB 显存。用 `--num_persistent_param_in_dit 0` 全卸载 → 每次前向都从内存搬参数 → GPU 利用率仅 ~50%（传输瓶颈）、单步极慢。调高 `num_persistent`（如 5e9）可缓解但显存贴边（9960/10240MiB）易 OOM。
+2. **fp8 量化的 CUDA 编译**：不带 `--t5_cpu` 时 optimum-quanto 要现编 marlin 内核，缺 `cuda_runtime_api.h`（无 CUDA 开发头文件）即失败。带 `--t5_cpu` 走 CPU 内核可绕过。
+3. **bf16 吃内存**：不量化的 bf16 加载峰值 ~43-60GB；**WSL2 默认只给 ~31GB 内存** → `Killed`(OOM)。需在 Windows 的 `C:\Users\<你>\.wslconfig` 写 `[wsl2]\nmemory=50GB\nswap=32GB`，再 `wsl --shutdown` 重启生效。
+4. **依赖版本三角**（亲测可用组合）：
+   - `torch==2.4.1 (cu121)` + `xformers==0.0.28`
+   - `transformers==4.49.0`（5.x 不兼容）
+   - `diffusers==0.33.1`（0.38 的 attention_dispatch 与 torch2.4 冲突；0.31 又缺 xfuser 要的 `sana_transformer`；0.33.1 是甜点位）
+   - `flash_attn==2.7.4.post1` 用预编译 wheel（`cu12torch2.4cxx11abiFALSE-cp310`），免 nvcc 编译
+5. **t5_cpu 的 bug**（本仓库已修，commit `Fix t5_cpu context...`）：`wan/multitalk.py` 的 t5_cpu 分支把 `context` 多包了一层 list，导致 `multitalk_model.forward` 报 `'list' object has no attribute 'dtype'`。修法：该分支末尾对 context/context_null 取 `[0]`。
+6. **权重下载**：新版 `hf`(huggingface_hub 1.17) 不认 `HF_ENDPOINT` 镜像、hf-xet 还绕过镜像 → 国内直接用 **ModelScope**：`modelscope download --model Wan-AI/Wan2.1-I2V-14B-480P` 和 `MeiGen-AI/InfiniteTalk`。
+7. **散热**：offload 把 CPU（如 i9-11900K）烤到 94°C 降频；给 GPU 设 **70% 功率墙** + 用 Wan2GP 的高效负载可明显缓解。
+
+### 何时仍用原版仓库
+显存 **≥24GB**（RTX 3090/4090）：整模型直接进显存、零搬运、原生 CUDA，原版仓库 + `mv/make_mv.py` 跑得又快又稳。**这才是想本地爽跑的真正硬件解**（比上 Mac 实在——InfiniteTalk 是 CUDA 生态，Apple Metal 无官方支持）。
+
+---
+
 ## 四、画面描述（prompt）怎么写
 
 英文、具体、像在描述一个镜头。模板：
