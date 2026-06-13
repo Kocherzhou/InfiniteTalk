@@ -179,7 +179,7 @@
 </div>
 
 <script>
-  let imgFiles = [], imgPrompts = [], audFile = null, evt = null, curJob = null;
+  let imgFiles = [], imgPrompts = [], imgStatic = [], audFile = null, evt = null, curJob = null;
 
   function bindDrop(dropEl, inputEl, accept, onPick) {
     dropEl.addEventListener('click', () => inputEl.click());
@@ -192,7 +192,7 @@
 
   // 图片区：支持多选（多机位）。每次选/拖会"追加"，方便分多次挑图。
   function addImages(fileList) {
-    for (const f of fileList) if (f && f.type.startsWith('image/')) { imgFiles.push(f); imgPrompts.push(''); }
+    for (const f of fileList) if (f && f.type.startsWith('image/')) { imgFiles.push(f); imgPrompts.push(''); imgStatic.push(false); }
     renderImages();
     renderPerPrompts();
     refreshGo();
@@ -275,14 +275,22 @@
            <img style="width:64px;height:64px;object-fit:cover;border-radius:8px" src="${URL.createObjectURL(f)}">
            <span style="position:absolute;top:2px;left:2px;background:#000a;color:#fff;border-radius:4px;padding:0 5px;font-size:11px">${i + 1}</span>
          </div>
-         <textarea data-idx="${i}" class="perPrompt" style="min-height:64px;font-size:12.5px"
-           placeholder="机位 ${i + 1} 的镜头/情绪描述（留空用全局）">${imgPrompts[i] || ''}</textarea>
+         <div style="flex:1;display:flex;flex-direction:column;gap:4px">
+           <textarea data-idx="${i}" class="perPrompt" style="min-height:64px;font-size:12.5px"
+             placeholder="机位 ${i + 1} 的镜头/情绪描述（留空用全局）">${imgPrompts[i] || ''}</textarea>
+           <label style="font-size:12px;color:var(--muted);cursor:pointer;user-select:none">
+             <input type="checkbox" class="staticChk" data-idx="${i}" ${imgStatic[i] ? 'checked' : ''}>
+             🛰️ 画外音/空镜（此段不对口型，静态画面+缓慢漂移）
+           </label>
+         </div>
        </div>` +
       (i + 1 < imgFiles.length
         ? `<div id="cutHint${i}" style="margin:0 0 8px 74px;font-size:11.5px;color:var(--muted)">✂ ${i + 1}→${i + 2} 剪接预判分析中…</div>`
         : '')).join('');
     list.querySelectorAll('.perPrompt').forEach(t =>
       t.addEventListener('input', () => { imgPrompts[+t.dataset.idx] = t.value; }));
+    list.querySelectorAll('.staticChk').forEach(c =>
+      c.addEventListener('change', () => { imgStatic[+c.dataset.idx] = c.checked; }));
     updateTransitions();
   }
 
@@ -351,7 +359,7 @@
     form.append('prompt', document.getElementById('prompt').value);
     let url;
     if (imgFiles.length > 1) {            // 多机位
-      imgFiles.forEach((f, i) => { form.append('images', f); form.append('prompts', imgPrompts[i] || ''); });
+      imgFiles.forEach((f, i) => { form.append('images', f); form.append('prompts', imgPrompts[i] || ''); form.append('static', imgStatic[i] ? '1' : '0'); });
       url = '/api/create_mtv';
     } else {                              // 单段
       form.append('image', imgFiles[0]);

@@ -481,6 +481,8 @@ def api_create_mtv():
     # 逐张分镜提示词（与 images 同序）。非空=「分镜词, 全局基底」拼接；空=直接用全局。
     # 容错：吃掉用户从对话里复制来的尾部「+ 基底」占位符。
     per_prompts = [re.sub(r"[+＋]\s*基底\s*$", "", p.strip()).rstrip(" ,") for p in request.form.getlist("prompts")]
+    # 逐张「画外音/空镜」标志(与 images 同序,"1"=该段不对口型、走静态图+音频)
+    static_flags = request.form.getlist("static")
     n = len(images)
     parent_id = uuid.uuid4().hex
     apath = UPLOAD_DIR / f"{parent_id}_audio.{_ext(audio.filename, AUDIO_EXTS, 'wav')}"
@@ -528,12 +530,13 @@ def api_create_mtv():
                              "vocals enter, restrained natural expression")
             note = f"🟡 第{i+1}段：开头约 {sec:.1f}s 低能量（疑似前奏/间奏），已注入「等人声再开口」"
             parent["vad"].append(note); add_log(parent, note)
+        is_static = i < len(static_flags) and static_flags[i] == "1"
         child_jobs.append({
             "id": cid, "status": "queued", "progress": 0, "message": "排队中…",
             "prompt": child_prompt, "image_name": im.filename, "audio_name": f"第{i+1}段",
             "logs": [], "created": t0 + i * 0.001,   # 保序：seg0 先被领
             "_image": str(ipath), "_audio": str(capath),
-            "_parent": parent_id, "seg_index": i,
+            "_parent": parent_id, "seg_index": i, "static": is_static,
         })
         parent["children"].append(cid)
 
@@ -661,6 +664,7 @@ def worker_claim():
                 "prompt": job["prompt"],
                 "image_ext": Path(job["_image"]).suffix.lstrip("."),
                 "audio_ext": Path(job["_audio"]).suffix.lstrip("."),
+                "static": bool(job.get("static")),
             })
     return ("", 204)
 

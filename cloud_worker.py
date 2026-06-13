@@ -272,6 +272,48 @@ def run_mock(cli, job, img_path, aud_path):
     return out_mp4
 
 
+def run_static(cli, job, img_path, aud_path):
+    """画外音/空镜段：不跑 InfiniteTalk，ffmpeg 把静态图配音频 + 极缓慢推近(Ken Burns)。
+    纯宇宙空镜(无人脸)走这条路：秒级、不耗 GPU、不会因检测不到人脸报错。
+    STATIC_ZOOM=0 可关漂移退回纯静帧。输出保持原图宽高比，拼接时 stitch 再统一画幅。"""
+    job_id = job["job_id"]
+    out_mp4 = WORK_DIR / f"{job_id}.mp4"
+    progress(cli, job_id, status="generating", progress=40,
+             message="画外音空镜段：静态画面+音频（缓慢漂移）…", log="static/voiceover 渲染")
+
+    def _probe(path, args):
+        return subprocess.run(["ffprobe", "-v", "error", *args, str(path)],
+                              capture_output=True, text=True).stdout.strip()
+    try:
+        dur = float(_probe(aud_path, ["-show_entries", "format=duration",
+                                      "-of", "default=nw=1:nk=1"]))
+    except Exception:
+        dur = 10.0
+    try:
+        w, h = map(int, _probe(img_path, ["-select_streams", "v:0", "-show_entries",
+                                          "stream=width,height", "-of", "csv=p=0"]).split(","))
+    except Exception:
+        w, h = 768, 768
+    s = min(1.0, 960.0 / max(w, h))                 # 长边 ≤960
+    tw = (int(round(w * s)) // 2 * 2) or 2
+    th = (int(round(h * s)) // 2 * 2) or 2
+    frames = max(1, int(round(dur * 25)))
+    if os.environ.get("STATIC_ZOOM", "1") == "1":   # 缓慢推近(预放大4倍防抖)
+        vf = (f"scale={tw*4}:{th*4},zoompan=z='min(zoom+0.0004,1.12)':"
+              f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':"
+              f"d={frames}:fps=25:s={tw}x{th},setsar=1,format=yuv420p")
+    else:
+        vf = f"scale={tw}:{th},setsar=1,fps=25,format=yuv420p"
+    cmd = ["ffmpeg", "-y", "-loop", "1", "-framerate", "25", "-t", f"{dur:.3f}",
+           "-i", str(img_path), "-i", str(aud_path), "-vf", vf,
+           "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+           "-c:a", "aac", "-b:a", "192k", "-shortest", str(out_mp4)]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0 or not out_mp4.exists():
+        raise RuntimeError(f"static render failed: {(proc.stderr or '')[-300:]}")
+    return out_mp4
+
+
 def handle(cli, job, mock):
     job_id = job["job_id"]
     img = WORK_DIR / f"{job_id}_in.{job.get('image_ext', 'png')}"
@@ -280,7 +322,12 @@ def handle(cli, job, mock):
     download(cli, job_id, "image", img)
     download(cli, job_id, "audio", aud)
 
-    runner = run_mock if mock else run_infinitetalk
+    if mock:
+        runner = run_mock
+    elif job.get("static"):
+        runner = run_static          # 画外音/空镜段:静态图+音频,不对口型
+    else:
+        runner = run_infinitetalk
     out_mp4 = runner(cli, job, img, aud)
 
     progress(cli, job_id, status="uploading", progress=95, message="回传成品…", log="生成完成，回传中")
