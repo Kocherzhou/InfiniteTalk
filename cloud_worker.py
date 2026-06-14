@@ -299,11 +299,31 @@ def run_static(cli, job, img_path, aud_path):
     th = (int(round(h * s)) // 2 * 2) or 2
     frames = max(1, int(round(dur * 25)))
     if os.environ.get("STATIC_ZOOM", "1") == "1":
-        # 连续缓慢推近:d=1+pzoom 逐帧累积(-loop 1 下唯一可靠写法);增量按时长摊到全段
-        # → 1.0→1.15 贯穿整段、肉眼可见但不晃(旧的 d=帧数+zoom 在 loop 下几乎不动)。
-        inc = round(0.15 / frames, 6)
-        vf = (f"scale={tw*2}:{th*2},zoompan=z='min(pzoom+{inc},1.15)':d=1:"
-              f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s={tw}x{th}:fps=25,"
+        # Ken Burns 运镜。关键两点(2026-06-14 改进,修"傻乎乎抖动"):
+        # ① 8× 预放大再 zoompan:旧版只 2× → 每帧 x/y 裁切坐标整数取整、缩放慢时逐帧
+        #    跳 ~1px = 肉眼抖。预放大到长边 ~3840 → 每帧位移变亚像素级 → 丝滑。
+        # ② 运动模式池:旧版每段都 1.0→1.15 居中推近、单调且幅度小。改成 5 种运镜
+        #    (推近/拉远/左右移/上下移/起手放大再横移),按 job_id 散列轮换(worker 的
+        #    job 无 seg_index),空镜段之间就有节奏变化。on=输出帧序号,线性匀速。
+        long_edge = max(tw, th)
+        ss = max(2, int(round(3840.0 / max(1, long_edge))))   # 长边预放大到 ~3840
+        bw, bh = tw * ss, th * ss
+        N = frames
+        amp = 0.28                                            # 推/拉幅度 1.0→1.28
+        cx, cy = "iw/2-(iw/zoom/2)", "ih/2-(ih/zoom/2)"
+        mode = int(job_id[:8], 16) % 5
+        if mode == 0:        # 推近
+            z, x, y = f"1+{amp}*on/{N}", cx, cy
+        elif mode == 1:      # 拉远(起手放大、缓收)
+            z, x, y = f"{1 + amp:.2f}-{amp}*on/{N}", cx, cy
+        elif mode == 2:      # 左→右平移(轻放大留出余量)
+            z, x, y = "1.12", f"(iw-iw/zoom)*on/{N}", cy
+        elif mode == 3:      # 上→下平移
+            z, x, y = "1.12", cx, f"(ih-ih/zoom)*on/{N}"
+        else:                # 起手放大 1.30 再横移(揭示式)
+            z, x, y = "1.30", f"(iw-iw/zoom)*on/{N}", cy
+        vf = (f"scale={bw}:{bh}:flags=bicubic,"
+              f"zoompan=z='{z}':d=1:x='{x}':y='{y}':s={tw}x{th}:fps=25,"
               f"setsar=1,format=yuv420p")
     else:
         vf = f"scale={tw}:{th},setsar=1,fps=25,format=yuv420p"
