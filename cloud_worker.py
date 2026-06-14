@@ -309,7 +309,7 @@ def run_static(cli, job, img_path, aud_path):
         ss = max(2, int(round(3840.0 / max(1, long_edge))))   # 长边预放大到 ~3840
         bw, bh = tw * ss, th * ss
         N = frames
-        amp = 0.28                                            # 推/拉幅度 1.0→1.28
+        amp = 0.16                                            # 推/拉幅度 1.0→1.16(温柔,星空段防爬行闪)
         cx, cy = "iw/2-(iw/zoom/2)", "ih/2-(ih/zoom/2)"
         mode = int(job_id[:8], 16) % 5
         if mode == 0:        # 推近
@@ -322,8 +322,12 @@ def run_static(cli, job, img_path, aud_path):
             z, x, y = "1.12", cx, f"(ih-ih/zoom)*on/{N}"
         else:                # 起手放大 1.30 再横移(揭示式)
             z, x, y = "1.30", f"(iw-iw/zoom)*on/{N}", cy
+        # 抗闪(2026-06-14):zoompan 内部降采样抗锯齿不足 → 星空高频亮点慢放大时"爬行/闪"。
+        # 修法:zoompan 先出 2× 再用 lanczos 降到目标 + 轻 gblur 压高频。lanczos/gblur 纯质量、
+        # 全空镜段通用;配合 amp 调温柔,星空也稳。
         vf = (f"scale={bw}:{bh}:flags=bicubic,"
-              f"zoompan=z='{z}':d=1:x='{x}':y='{y}':s={tw}x{th}:fps=25,"
+              f"zoompan=z='{z}':d=1:x='{x}':y='{y}':s={tw*2}x{th*2}:fps=25,"
+              f"gblur=sigma=0.5,scale={tw}:{th}:flags=lanczos,"
               f"setsar=1,format=yuv420p")
     else:
         vf = f"scale={tw}:{th},setsar=1,fps=25,format=yuv420p"
