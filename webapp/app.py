@@ -483,6 +483,8 @@ def api_create_mtv():
     per_prompts = [re.sub(r"[+＋]\s*基底\s*$", "", p.strip()).rstrip(" ,") for p in request.form.getlist("prompts")]
     # 逐张「画外音/空镜」标志(与 images 同序,"1"=该段不对口型、走静态图+音频)
     static_flags = request.form.getlist("static")
+    # 逐张军师运镜建议(与 images 同序,如"推近/拉远/左右移";空=未用军师)。存档给本地 finalize 用
+    motion_flags = request.form.getlist("motion")
     n = len(images)
     parent_id = uuid.uuid4().hex
     apath = UPLOAD_DIR / f"{parent_id}_audio.{_ext(audio.filename, AUDIO_EXTS, 'wav')}"
@@ -537,6 +539,7 @@ def api_create_mtv():
             "logs": [], "created": t0 + i * 0.001,   # 保序：seg0 先被领
             "_image": str(ipath), "_audio": str(capath),
             "_parent": parent_id, "seg_index": i, "static": is_static,
+            "motion": motion_flags[i] if i < len(motion_flags) else "",
         })
         parent["children"].append(cid)
 
@@ -546,6 +549,43 @@ def api_create_mtv():
             jobs[c["id"]] = c
     save_jobs()
     return jsonify({"job_id": parent_id})
+
+
+# ── 军师参谋（本地 gemma4 视觉：语义级排序 + 逐图运镜建议）─────────────────
+# start 存图+起【独立子进程】advisor_runner.py(脱离 flask,服务重启打不死它),
+# 进度/结果由子进程写盘 adv_<tid>_status.json;status 路由只读这个文件。
+# 安全:逐图理解走 GPU+温控节流,最后长推理走 CPU(护没修散热的 3080)。
+@app.route("/api/advisor/start", methods=["POST"])
+def api_advisor_start():
+    images = [im for im in request.files.getlist("images") if im and im.filename]
+    if len(images) < 2:
+        return jsonify({"error": "至少 2 张图才需要军师排序"}), 400
+    hint = (request.form.get("hint") or "").strip()
+    tid = uuid.uuid4().hex
+    for i, im in enumerate(images):
+        im.save(str(UPLOAD_DIR / f"adv_{tid}_{i}.{_ext(im.filename, IMAGE_EXTS, 'png')}"))
+    if hint:
+        (UPLOAD_DIR / f"adv_{tid}_lyrics.txt").write_text(hint, encoding="utf-8")
+    status = UPLOAD_DIR / f"adv_{tid}_status.json"
+    status.write_text(json.dumps({"state": "running", "stage": "describe", "i": 0,
+                                  "n": len(images), "msg": "军师启动…", "result": None,
+                                  "error": None}, ensure_ascii=False), encoding="utf-8")
+    # 独立子进程:start_new_session 脱离 flask 进程组,flask 重启/被杀都不影响它
+    subprocess.Popen(["/usr/bin/python3", str(BASE / "advisor_runner.py"), tid],
+                     cwd=str(BASE), start_new_session=True,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return jsonify({"tid": tid})
+
+
+@app.route("/api/advisor/status/<tid>")
+def api_advisor_status(tid):
+    f = UPLOAD_DIR / f"adv_{tid}_status.json"
+    if not f.exists():
+        return jsonify({"error": "无此任务"}), 404
+    try:
+        return jsonify(json.loads(f.read_text(encoding="utf-8")))
+    except Exception:
+        return jsonify({"state": "running", "msg": "读取中…"})   # 写盘瞬间偶发,下次轮询即好
 
 
 def _finalize_parent(child):

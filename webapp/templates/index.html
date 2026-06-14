@@ -143,7 +143,9 @@
     <div class="field" id="perPromptField" style="display:none">
       <label>分镜提示词（逐张生效，自动在末尾拼接上面的全局基底；留空=只用全局）
         <button type="button" id="autoArcBtn" style="margin-left:8px;font-size:12px;padding:3px 11px;border-radius:6px;border:1px solid var(--accent);background:transparent;color:var(--accent);cursor:pointer">✨ 一键铺情绪曲线</button>
+        <button type="button" id="advisorBtn" style="margin-left:6px;font-size:12px;padding:3px 11px;border-radius:6px;border:1px solid #a78bfa;background:transparent;color:#a78bfa;cursor:pointer">🧠 军师参谋（本地排序+运镜）</button>
       </label>
+      <div id="advisorPanel" style="display:none;margin:6px 0 10px;padding:10px 12px;border:1px solid #a78bfa55;background:#a78bfa10;border-radius:10px;font-size:12.5px;line-height:1.6"></div>
       <div id="perPromptList"></div>
     </div>
 
@@ -179,7 +181,7 @@
 </div>
 
 <script>
-  let imgFiles = [], imgPrompts = [], imgStatic = [], audFile = null, evt = null, curJob = null;
+  let imgFiles = [], imgPrompts = [], imgStatic = [], imgMotion = [], audFile = null, evt = null, curJob = null;
 
   function bindDrop(dropEl, inputEl, accept, onPick) {
     dropEl.addEventListener('click', () => inputEl.click());
@@ -192,7 +194,7 @@
 
   // 图片区：支持多选（多机位）。每次选/拖会"追加"，方便分多次挑图。
   function addImages(fileList) {
-    for (const f of fileList) if (f && f.type.startsWith('image/')) { imgFiles.push(f); imgPrompts.push(''); imgStatic.push(false); }
+    for (const f of fileList) if (f && f.type.startsWith('image/')) { imgFiles.push(f); imgPrompts.push(''); imgStatic.push(false); imgMotion.push(''); }
     renderImages();
     renderPerPrompts();
     refreshGo();
@@ -202,7 +204,7 @@
   function moveImg(i, dir) {
     const j = i + dir;
     if (j < 0 || j >= imgFiles.length) return;
-    [imgFiles, imgPrompts, imgStatic].forEach(a => { const t = a[i]; a[i] = a[j]; a[j] = t; });
+    [imgFiles, imgPrompts, imgStatic, imgMotion].forEach(a => { const t = a[i]; a[i] = a[j]; a[j] = t; });
     imgHashes = [];
     renderImages();
     renderPerPrompts();
@@ -297,6 +299,7 @@
              <input type="checkbox" class="staticChk" data-idx="${i}" ${imgStatic[i] ? 'checked' : ''}>
              🛰️ 画外音/空镜（此段不对口型，静态画面+缓慢漂移）
            </label>
+           ${imgMotion[i] ? `<div style="font-size:11.5px;color:#a78bfa">🎥 军师运镜：${imgMotion[i]}</div>` : ''}
          </div>
        </div>` +
       (i + 1 < imgFiles.length
@@ -343,6 +346,109 @@
   }
   document.getElementById('autoArcBtn').addEventListener('click', autoFillArc);
 
+  // ── 🧠 军师参谋：本地 gemma4 看图 → 排序 + 逐图运镜建议（异步熬粥，约几分钟）──
+  const LV = { green: ['🟢', '#4ade80'], yellow: ['🟡', '#fbbf24'], red: ['🔴', '#f87171'] };
+  function applyOrder(perm) {   // perm: 1-indexed 数组，按它重排四个并行数组
+    const idx = perm.map(x => x - 1).filter(i => i >= 0 && i < imgFiles.length);
+    if (idx.length !== imgFiles.length) { alert('建议顺序与图片数不符，已忽略'); return; }
+    imgFiles = idx.map(i => imgFiles[i]);
+    imgPrompts = idx.map(i => imgPrompts[i]);
+    imgStatic = idx.map(i => imgStatic[i]);
+    imgMotion = idx.map(i => imgMotion[i]);
+    imgHashes = [];
+    renderImages(); renderPerPrompts(); refreshGo();
+  }
+  function renderAdvice(r) {
+    const panel = document.getElementById('advisorPanel');
+    const esc = s => (s || '').replace(/[<>&]/g, c => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;' }[c]));
+    let h = '';
+    if (r.overall) h += `<div style="margin-bottom:6px"><b>📽️ 整体观感</b>：${esc(r.overall)}</div>`;
+    if (r.first) h += `<div>🎬 <b>开场</b>：${esc(r.first)}</div>`;
+    if (r.last) h += `<div style="margin-bottom:6px">🏁 <b>收尾</b>：${esc(r.last)}</div>`;
+    if (Array.isArray(r.transitions) && r.transitions.length) {
+      h += `<div style="margin:6px 0 2px"><b>✂ 衔接预判</b></div>`;
+      h += r.transitions.map(t => { const v = LV[t.level] || ['⚪', 'var(--muted)'];
+        return `<div style="color:${v[1]}">${v[0]} ${t.from}→${t.to}：${esc(t.note)}</div>`; }).join('');
+    }
+    if (Array.isArray(r.motions) && r.motions.length) {
+      h += `<div style="margin:6px 0 2px"><b>🎥 逐图运镜</b></div>`;
+      h += r.motions.map(m => `<div style="color:#a78bfa">第${m.img}张 → <b>${esc(m.motion)}</b>　<span style="color:var(--muted)">${esc(m.reason)}</span></div>`).join('');
+    }
+    const so = r.suggested_order;
+    if (so) {
+      const nums = (typeof so === 'string' ? so : '').match(/\d+/g);
+      h += `<div style="margin-top:8px;padding-top:8px;border-top:1px solid #a78bfa33">🔀 <b>建议顺序</b>：${esc(typeof so === 'string' ? so : JSON.stringify(so))}</div>`;
+      if (nums && nums.length === imgFiles.length) {
+        h += `<button id="applyOrderBtn" type="button" style="margin-top:6px;font-size:12px;padding:4px 12px;border-radius:6px;border:1px solid #a78bfa;background:#a78bfa22;color:#a78bfa;cursor:pointer">✅ 应用此顺序（图片重排）</button>`;
+      }
+    }
+    panel.innerHTML = h || '军师没有返回有效建议（可重试）。';
+    panel.style.display = 'block';
+    // 先把运镜建议落进 imgMotion（按原始上传序），再渲染列表显示
+    if (Array.isArray(r.motions)) r.motions.forEach(m => { if (m.img >= 1 && m.img <= imgMotion.length) imgMotion[m.img - 1] = m.motion; });
+    renderPerPrompts();
+    const ab = document.getElementById('applyOrderBtn');
+    if (ab) ab.addEventListener('click', () => applyOrder((typeof so === 'string' ? so : '').match(/\d+/g).map(Number)));
+  }
+  let advisorLyrics = '';   // 记住已填歌词，重点军师不用重填
+  // 第一步：点军师 → 先让填歌词（排序的"剧本"），不直接开跑
+  document.getElementById('advisorBtn').addEventListener('click', () => {
+    if (imgFiles.length < 2) { alert('先至少添加 2 张图'); return; }
+    const panel = document.getElementById('advisorPanel');
+    panel.style.display = 'block';
+    panel.innerHTML =
+      `<div style="margin-bottom:6px"><b>📝 贴上这首歌的歌词</b>（军师据歌词的叙事/情绪走向来排画面；标注词如 <code>[副歌]</code>/<code>(男)</code> 可保留，它会自行理解）</div>
+       <textarea id="advisorLyrics" style="width:100%;min-height:110px;font-size:12.5px" placeholder="把整首歌词粘进来…&#10;（留空也能跑，但只能靠画面本身猜情绪，排序会粗糙）">${advisorLyrics.replace(/</g, '&lt;')}</textarea>
+       <button id="advisorRunBtn" type="button" style="margin-top:6px;font-size:12.5px;padding:5px 14px;border-radius:6px;border:1px solid #a78bfa;background:#a78bfa22;color:#a78bfa;cursor:pointer">🍲 开始熬粥分析（约几分钟）</button>`;
+    document.getElementById('advisorRunBtn').addEventListener('click', () => {
+      advisorLyrics = document.getElementById('advisorLyrics').value.trim();
+      runAdvisor(advisorLyrics);
+    });
+  });
+
+  // 第二步:带歌词起异步分析 + 轮询熬粥进度
+  async function runAdvisor(lyrics) {
+    const btn = document.getElementById('advisorBtn');
+    const panel = document.getElementById('advisorPanel');
+    btn.disabled = true;
+    panel.innerHTML = '🧠 军师启动中…（本地 gemma4 熬粥，逐图降温到 55°C 再喂，约几分钟，别关页面）';
+    try {
+      const form = new FormData();
+      imgFiles.forEach(f => form.append('images', f));
+      // 歌词作为排序"剧本"；没填则退回用视觉全局提示词
+      form.append('hint', lyrics || document.getElementById('prompt').value || '');
+      const r0 = await fetch('/api/advisor/start', { method: 'POST', body: form });
+      const d0 = await r0.json();
+      if (d0.error) throw new Error(d0.error);
+      const tid = d0.tid;
+      const t0 = Date.now();
+      const poll = setInterval(async () => {
+        try {
+          const r = await fetch('/api/advisor/status/' + tid);
+          const d = await r.json();
+          const sec = Math.round((Date.now() - t0) / 1000);
+          if (d.error || !d.state) {        // 任务丢了(多半服务重启过)→ 别傻等,提示重跑
+            clearInterval(poll); btn.disabled = false;
+            panel.innerHTML = '⚠️ 军师任务丢失（服务可能重启了）。请重新点「🧠 军师参谋」再跑一次（歌词已记住）。';
+            return;
+          }
+          if (d.state === 'running') {
+            panel.innerHTML = `🧠 ${d.msg || '军师工作中'}　<span style="color:var(--muted)">（已 ${sec}s）</span>`;
+          } else if (d.state === 'done') {
+            clearInterval(poll); btn.disabled = false;
+            renderAdvice((d.result && d.result.result) || {});
+          } else if (d.state === 'error') {
+            clearInterval(poll); btn.disabled = false;
+            panel.innerHTML = `❌ 军师失败：${d.error || '未知错误'}<br><span style="color:var(--muted)">检查本机 Ollama(gemma4) 是否在跑。</span>`;
+          }
+        } catch (e) { /* 轮询抖动，下次再试 */ }
+      }, 2500);
+    } catch (e) {
+      btn.disabled = false;
+      panel.innerHTML = '❌ 启动失败：' + e.message;
+    }
+  }
+
   (function () {
     const drop = document.getElementById('dropImage'), inp = document.getElementById('fileImage');
     drop.addEventListener('click', () => inp.click());
@@ -376,7 +482,7 @@
     form.append('prompt', document.getElementById('prompt').value);
     let url;
     if (imgFiles.length > 1) {            // 多机位
-      imgFiles.forEach((f, i) => { form.append('images', f); form.append('prompts', imgPrompts[i] || ''); form.append('static', imgStatic[i] ? '1' : '0'); });
+      imgFiles.forEach((f, i) => { form.append('images', f); form.append('prompts', imgPrompts[i] || ''); form.append('static', imgStatic[i] ? '1' : '0'); form.append('motion', imgMotion[i] || ''); });
       url = '/api/create_mtv';
     } else {                              // 单段
       form.append('image', imgFiles[0]);
