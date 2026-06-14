@@ -234,20 +234,76 @@ def _stitch_xfade(clip_paths, out_path, dur):
         raise RuntimeError(f"xfade 拼接失败: {(r.stderr or '')[-300:]}")
 
 
-def stitch_clips(clip_paths, out_path):
-    """按序把多段 mp4 拼成一片。XFADE_FRAMES>0 走交叉淡化（失败自动回退硬切），=0 硬切。"""
+FONT_SERIF = "/usr/share/fonts/opentype/noto/NotoSerifCJK-Bold.ttc"
+FONT_SANS = "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc"
+
+
+def _burn_titlecard(src, dst, tc):
+    """成片开头烧歌名(第1行)+词曲作者(第2行)字幕卡,均居中。
+    淡入≈1.5s 浮现 → 保持 → 结束前 2s 淡出 → dur 秒后消失(落在前奏里)。
+    textfile= 传文本,任意字符(含冒号)免转义;alpha 表达式内逗号用 \\, 转义。"""
+    import tempfile
+    font = FONT_SANS if tc.get("font") == "sans" else FONT_SERIF
+    W, H = _video_dims(src)
+    size = int(tc.get("size", 50))
+    csize = max(16, int(size * 0.5))
+    color = (tc.get("color", "#ffffff") or "#ffffff").lstrip("#")
+    y = H * int(tc.get("ypos", 36)) / 100.0
+    dur = float(tc.get("dur", 10))
+    fo = max(2.0, dur - 2.0)
+    A = (f"if(lt(t\\,1.5)\\,t/1.5\\,if(lt(t\\,{fo:.2f})\\,1\\,"
+         f"if(lt(t\\,{dur:.2f})\\,({dur:.2f}-t)/({dur:.2f}-{fo:.2f})\\,0)))")
+    tmps, filters = [], []
+
+    def _df(text, fs, bw, yy):
+        tf = tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8")
+        tf.write(text); tf.close(); tmps.append(tf.name)
+        return (f"drawtext=fontfile={font}:textfile={tf.name}:fontcolor=0x{color}:"
+                f"fontsize={fs}:borderw={bw}:bordercolor=black@0.7:"
+                f"x=(w-text_w)/2:y={yy:.0f}:alpha={A}")
+
+    filters.append(_df(tc.get("title", ""), size, 2, y))
+    credits = (tc.get("credits") or "").strip()
+    if credits:
+        filters.append(_df(credits, csize, 1.5, y + size + 24))
+    cmd = [FFMPEG, "-y", "-i", str(src), "-vf", ",".join(filters),
+           "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+           "-c:a", "copy", str(dst)]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    for f in tmps:
+        try:
+            os.remove(f)
+        except OSError:
+            pass
+    if r.returncode != 0 or not os.path.exists(dst):
+        raise RuntimeError(f"字幕卡烧录失败: {(r.stderr or '')[-200:]}")
+
+
+def stitch_clips(clip_paths, out_path, titlecard=None):
+    """按序把多段 mp4 拼成一片。XFADE_FRAMES>0 走交叉淡化（失败自动回退硬切），=0 硬切。
+    titlecard(可选): 拼完后再烧开头歌名/词曲作者字幕卡。"""
     if not clip_paths:
         raise RuntimeError("没有可拼接的片段")
+    stitched = f"{out_path}.pretitle.mp4" if titlecard else str(out_path)
     if len(clip_paths) == 1:
-        shutil.copyfile(clip_paths[0], out_path)
-        return
-    if XFADE_FRAMES > 0:
+        shutil.copyfile(clip_paths[0], stitched)
+    else:
+        done = False
+        if XFADE_FRAMES > 0:
+            try:
+                _stitch_xfade(clip_paths, stitched, XFADE_FRAMES / XFADE_FPS)
+                done = True
+            except Exception as e:
+                print(f"⚠ xfade 拼接失败，回退硬切：{e}")
+        if not done:
+            _stitch_hardcut(clip_paths, stitched)
+    if titlecard:
         try:
-            _stitch_xfade(clip_paths, out_path, XFADE_FRAMES / XFADE_FPS)
-            return
+            _burn_titlecard(stitched, str(out_path), titlecard)
+            os.remove(stitched)
         except Exception as e:
-            print(f"⚠ xfade 拼接失败，回退硬切：{e}")
-    _stitch_hardcut(clip_paths, out_path)
+            print(f"⚠ 字幕卡烧录失败，保留无卡成片：{e}")
+            os.replace(stitched, str(out_path))
 
 app = Flask(__name__)
 
@@ -483,6 +539,19 @@ def api_create_mtv():
     per_prompts = [re.sub(r"[+＋]\s*基底\s*$", "", p.strip()).rstrip(" ,") for p in request.form.getlist("prompts")]
     # 逐张「画外音/空镜」标志(与 images 同序,"1"=该段不对口型、走静态图+音频)
     static_flags = request.form.getlist("static")
+    # 开头字幕卡(歌名/词曲作者 + 样式);歌名留空 = 不加卡
+    _st = (request.form.get("song_title") or "").strip()
+    titlecard = None
+    if _st:
+        titlecard = {
+            "title": _st,
+            "credits": (request.form.get("song_credits") or "").strip(),
+            "font": request.form.get("tc_font") or "serif",
+            "size": int(float(request.form.get("tc_size") or 50)),
+            "color": request.form.get("tc_color") or "#ffffff",
+            "ypos": int(float(request.form.get("tc_ypos") or 36)),
+            "dur": float(request.form.get("tc_dur") or 10),
+        }
     n = len(images)
     parent_id = uuid.uuid4().hex
     apath = UPLOAD_DIR / f"{parent_id}_audio.{_ext(audio.filename, AUDIO_EXTS, 'wav')}"
@@ -501,6 +570,7 @@ def api_create_mtv():
         "message": f"已切成 {n} 段，{n} 个子任务排队中，等待云端逐段生成…",
         "prompt": prompt, "logs": [], "created": t0, "n": n, "children": [],
         "vad": [],                                   # 人声活动检测预警（前奏/间奏注入提示）
+        "titlecard": titlecard,                      # 开头歌名/词曲作者字幕卡（None=不加）
     }
     add_log(parent, f"切歌完成（{n} 段），开始排队")
 
@@ -578,7 +648,7 @@ def _do_stitch(pid):
     parent = jobs.get(pid)
     try:
         clips = [str(UPLOAD_DIR / f"{c}_out.mp4") for c in parent["children"]]
-        stitch_clips(clips, UPLOAD_DIR / f"{pid}_out.mp4")
+        stitch_clips(clips, UPLOAD_DIR / f"{pid}_out.mp4", titlecard=parent.get("titlecard"))
         parent["status"] = "completed"
         parent["progress"] = 100
         parent["message"] = "多机位 MTV 拼接完成 ✓"

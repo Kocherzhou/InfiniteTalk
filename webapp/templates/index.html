@@ -147,6 +147,35 @@
       <div id="perPromptList"></div>
     </div>
 
+    <div class="field">
+      <label>🎬 开头字幕卡（歌名 / 词曲作者，留空＝不加；仅多机位 MTV）</label>
+      <input type="text" id="songTitle" placeholder="歌名（第一行，居中）" style="margin-bottom:6px">
+      <input type="text" id="songCredits" placeholder="词曲作者（第二行，如：词/曲 周传哲）">
+      <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:8px 16px;margin-top:10px">
+        <div>
+          <label style="font-size:12px;color:var(--muted)">字体</label>
+          <select id="tcFont"><option value="serif">衬线（标题感）</option><option value="sans">黑体（清晰）</option></select>
+        </div>
+        <div>
+          <label style="font-size:12px;color:var(--muted)">歌名字号 <span id="tcSize_v">50</span></label>
+          <input type="range" id="tcSize" min="28" max="72" value="50" style="width:100%">
+        </div>
+        <div>
+          <label style="font-size:12px;color:var(--muted)">字色</label>
+          <input type="color" id="tcColor" value="#ffffff" style="width:100%;height:34px;padding:2px">
+        </div>
+        <div>
+          <label style="font-size:12px;color:var(--muted)">垂直位置（离顶%）<span id="tcYpos_v">36</span></label>
+          <input type="range" id="tcYpos" min="10" max="70" value="36" style="width:100%">
+        </div>
+        <div>
+          <label style="font-size:12px;color:var(--muted)">显示时长（秒）<span id="tcDur_v">10</span></label>
+          <input type="range" id="tcDur" min="6" max="14" value="10" style="width:100%">
+        </div>
+      </div>
+      <div class="note" style="margin-top:4px">淡入≈1.5s 浮现 → 保持 → 结束前淡出；落在前奏里、第一句歌词前消失。</div>
+    </div>
+
     <button class="go" id="goBtn" disabled>🎬 开始生成对口型视频</button>
     <div class="note">提交后任务进入队列；请开启云端 GPU（AutoDL），worker 会自动接单生成。</div>
   </div>
@@ -342,6 +371,10 @@
     renderPerPrompts();
   }
   document.getElementById('autoArcBtn').addEventListener('click', autoFillArc);
+  ['tcSize', 'tcYpos', 'tcDur'].forEach(k => {
+    const el = document.getElementById(k), v = document.getElementById(k + '_v');
+    if (el && v) el.addEventListener('input', () => v.textContent = el.value);
+  });
 
   (function () {
     const drop = document.getElementById('dropImage'), inp = document.getElementById('fileImage');
@@ -374,6 +407,14 @@
     const form = new FormData();
     form.append('audio', audFile);
     form.append('prompt', document.getElementById('prompt').value);
+    // 开头字幕卡（歌名/词曲作者 + 样式）
+    form.append('song_title', document.getElementById('songTitle').value.trim());
+    form.append('song_credits', document.getElementById('songCredits').value.trim());
+    form.append('tc_font', document.getElementById('tcFont').value);
+    form.append('tc_size', document.getElementById('tcSize').value);
+    form.append('tc_color', document.getElementById('tcColor').value);
+    form.append('tc_ypos', document.getElementById('tcYpos').value);
+    form.append('tc_dur', document.getElementById('tcDur').value);
     let url;
     if (imgFiles.length > 1) {            // 多机位
       imgFiles.forEach((f, i) => { form.append('images', f); form.append('prompts', imgPrompts[i] || ''); form.append('static', imgStatic[i] ? '1' : '0'); });
