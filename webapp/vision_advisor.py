@@ -9,7 +9,9 @@
 被 app.py 调用(也可 `python3 vision_advisor.py img1 img2 ...` 单测)。
 gemma4 是 thinking 模型,务必 think=False(否则输出夹带推理)。
 """
-import base64, json, os, re, subprocess, time, urllib.request
+import base64, hashlib, json, os, re, subprocess, time, urllib.request
+
+_DESC_CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "desc_cache")
 
 OLLAMA = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
 VISION_MODEL = os.environ.get("VISION_MODEL", "gemma4:12b-it-qat")
@@ -74,11 +76,23 @@ def _ollama(prompt, images=None, timeout=180, cpu=False):
 
 
 def describe_image(path):
-    b64 = base64.b64encode(open(path, "rb").read()).decode()
+    data = open(path, "rb").read()
+    cf = os.path.join(_DESC_CACHE, hashlib.md5(data).hexdigest() + ".txt")
+    if os.path.exists(cf):                       # 按图内容缓存:同图重跑跳过 GPU 描述
+        try:
+            return open(cf, encoding="utf-8").read()
+        except Exception:
+            pass
     p = ("用中文简洁描述这张MV机位图,只客观描述不发挥,一行内涵盖:"
          "景别(特写/近景/中景/全景)、机位角度(正面/侧面/俯/仰/平视)、"
          "人物数量与姿态朝向、构图、光线明暗。")
-    return _ollama(p, images=[b64])
+    desc = _ollama(p, images=[base64.b64encode(data).decode()])
+    try:
+        os.makedirs(_DESC_CACHE, exist_ok=True)
+        open(cf, "w", encoding="utf-8").write(desc)
+    except Exception:
+        pass
+    return desc
 
 
 def _extract_json(text):
@@ -125,6 +139,64 @@ def analyze_sequence(image_paths, song_hint="", progress_cb=None):
     raw = _ollama(prompt, timeout=900, cpu=True)   # 长推理走 CPU(护卡),给足超时
     result = _extract_json(raw) or {"raw": raw, "parse_error": True}
     return {"descriptions": descriptions, "result": result}
+
+
+def plan_shots(image_paths, slots, song_hint="", progress_cb=None):
+    """分镜排期师:给【结构镜头槽】(每槽含段落名/时长/空镜标记)分配 图+运镜。
+    slots: [{i,start,end,dur,section,role}]  role='空镜'强制用无人画面。
+    返回 {descriptions, plan:[{slot,img,motion,reason}]}。
+    逐图理解走 GPU+节流(短脉冲),排期长推理走 CPU(护卡)。"""
+    n = len(image_paths)
+    descriptions = []
+    for i, p in enumerate(image_paths):
+        if progress_cb:
+            progress_cb("describe", i, n)
+        descriptions.append(describe_image(p))
+    if progress_cb:
+        progress_cb("reason", n, n)
+    imgs = "\n".join(f"图{i+1}: {d}" for i, d in enumerate(descriptions))
+    slotlist = "\n".join(
+        f"槽{s['i']}: {s['start']:.0f}-{s['end']:.0f}s({s['dur']:.0f}s) 段落[{s['section']}]"
+        + ("　【必须空镜/无人画面】" if s.get("role") == "空镜" else "")
+        for s in slots)
+    m = len(slots)
+    prompt = f"""你是资深MV分镜导演。一首歌已按【音乐结构】切成 {m} 个镜头槽(每槽是一个乐句段落、长度不一),
+歌曲信息/歌词:
+{song_hint}
+
+镜头槽(按时间顺序,共{m}个):
+{slotlist}
+
+可用画面素材({n}张,可重复使用):
+{imgs}
+
+请为【每一个槽】分配一张图和一个运镜,排出完整分镜表。规则:
+- 标【必须空镜】的槽(前奏/尾奏)只能用"无人物/纯风景空镜"的图;其余槽优先用对应情绪的画面。
+- 图可重复(把关键画面当"视觉动机"),但**相邻两槽不要用同一张**(除非刻意延续)。**复用优先级:人物"弹唱位/演唱位"这类标准表演镜头是MV的视觉锚点,反复出现不疲劳,优先拿它复用(尤其副歌/华彩反复回到弹唱位);其次其他人物镜头;空镜/风景则尽量每个都不同、保持新鲜,别重复用同一张空镜(前奏与尾奏首尾呼应可例外)。**
+- 副歌/华彩(Chorus/Bridge/Final)配最有情感张力的人物近景/特写;主歌(Verse)配叙事中景;段落内被拆成 (1/2)(2/2) 的,两槽尽量换不同图或不同运镜,制造推进。
+- 运镜五选一:推近(情绪聚焦)/拉远(展开空间·宏大)/左右移(横向展开)/上下移(纵深天地)/放大横移(开场大场面)。同段相邻槽运镜尽量错开。
+只输出一个JSON对象:{{"plan":[{{"slot":0,"img":3,"motion":"拉远","reason":"一句话"}}, ...]}},plan 数组长度必须正好 {m}、slot 从0到{m-1}按序、img 是1到{n}的整数。不要别的文字。"""
+    def _good_plan(raw):
+        obj = _extract_json(raw)
+        plan = obj.get("plan") if isinstance(obj, dict) else (obj if isinstance(obj, list) else None)
+        if isinstance(plan, list) and len(plan) >= 1 and all(isinstance(x, dict) and "img" in x for x in plan):
+            # 补全/钳制:slot 缺则按序、img 钳到 1..n、motion 落到合法集
+            for k, p in enumerate(plan):
+                p["slot"] = p.get("slot", k)
+                try: p["img"] = min(n, max(1, int(p.get("img", 1))))
+                except Exception: p["img"] = 1
+                if p.get("motion") not in ("推近", "拉远", "左右移", "上下移", "放大横移"):
+                    p["motion"] = "推近"
+            return plan
+        return None
+    plan = None
+    for _ in range(3):                       # gemma 偶发坏 JSON → 最多重试 3 次(CPU)
+        plan = _good_plan(_ollama(prompt, timeout=900, cpu=True))
+        if plan:
+            break
+    if not plan:
+        raise RuntimeError("军师分镜输出解析失败(gemma JSON 3 次都不合法),请重试")
+    return {"descriptions": descriptions, "plan": plan}
 
 
 if __name__ == "__main__":

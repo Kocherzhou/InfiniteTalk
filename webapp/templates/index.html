@@ -144,13 +144,15 @@
       <label>分镜提示词（逐张生效，自动在末尾拼接上面的全局基底；留空=只用全局）
         <button type="button" id="autoArcBtn" style="margin-left:8px;font-size:12px;padding:3px 11px;border-radius:6px;border:1px solid var(--accent);background:transparent;color:var(--accent);cursor:pointer">✨ 一键铺情绪曲线</button>
         <button type="button" id="advisorBtn" style="margin-left:6px;font-size:12px;padding:3px 11px;border-radius:6px;border:1px solid #a78bfa;background:transparent;color:#a78bfa;cursor:pointer">🧠 军师参谋（本地排序+运镜）</button>
+        <button type="button" id="planBtn" style="margin-left:6px;font-size:12px;padding:3px 11px;border-radius:6px;border:1px solid #34d399;background:transparent;color:#34d399;cursor:pointer">🎬 结构分镜排期（按音乐结构切镜+派云机）</button>
       </label>
       <div id="advisorPanel" style="display:none;margin:6px 0 10px;padding:10px 12px;border:1px solid #a78bfa55;background:#a78bfa10;border-radius:10px;font-size:12.5px;line-height:1.6"></div>
+      <div id="planPanel" style="display:none;margin:6px 0 10px;padding:10px 12px;border:1px solid #34d39955;background:#34d39910;border-radius:10px;font-size:12.5px;line-height:1.6"></div>
       <div id="perPromptList"></div>
     </div>
 
     <button class="go" id="goBtn" disabled>🎬 开始生成对口型视频</button>
-    <div class="note">提交后任务进入队列；请开启云端 GPU（AutoDL），worker 会自动接单生成。</div>
+    <div class="note" id="goNote">提交后任务进入队列；请开启云端 GPU（AutoDL），worker 会自动接单生成。<br>💡 想要"按音乐结构切镜 + 自己调分镜"的好效果，用上面绿色的 <b>🎬 结构分镜排期</b>，调好后点它面板里的 <b>🚀 提交云机渲染</b>（不是本按钮）。</div>
   </div>
 
   <!-- progress -->
@@ -427,7 +429,7 @@
           const r = await fetch('/api/advisor/status/' + tid);
           const d = await r.json();
           const sec = Math.round((Date.now() - t0) / 1000);
-          if (d.error || !d.state) {        // 任务丢了(多半服务重启过)→ 别傻等,提示重跑
+          if (!d.state) {        // 真没 state=任务丢了(404/服务重启)→ 提示重跑;state=error 留给下面显示真错误
             clearInterval(poll); btn.disabled = false;
             panel.innerHTML = '⚠️ 军师任务丢失（服务可能重启了）。请重新点「🧠 军师参谋」再跑一次（歌词已记住）。';
             return;
@@ -447,6 +449,136 @@
       btn.disabled = false;
       panel.innerHTML = '❌ 启动失败：' + e.message;
     }
+  }
+
+  // ── 🎬 结构分镜排期:按音乐结构切镜头槽 + 军师排期 → 分镜表 → 提交云机 ──
+  let planResult = null, planStatic = [];
+  document.getElementById('planBtn').addEventListener('click', () => {
+    if (imgFiles.length < 2) { alert('先至少加 2 张图'); return; }
+    if (!audFile) { alert('结构排期需要歌曲音频,请先上传音频'); return; }
+    const panel = document.getElementById('planPanel');
+    panel.style.display = 'block';
+    panel.innerHTML =
+      `<div style="margin-bottom:6px"><b>🎬 结构分镜排期</b>（按音乐结构切镜:前奏/副歌/华彩各自起镜,军师排哪张图配哪段+运镜）</div>
+       <div style="margin-bottom:4px">Suno song_id（结构切镜要靠它的逐词对齐;在 suno.com 歌曲链接里那串 id）：</div>
+       <input id="planSongId" style="width:100%;font-size:12.5px;padding:4px" placeholder="例如 c3df932b-d63d-4d57-912b-a262c8c1c9b2">
+       <textarea id="planLyrics" style="width:100%;min-height:90px;font-size:12.5px;margin-top:6px" placeholder="歌词（可留空;有则军师排得更准）">${(advisorLyrics || '').replace(/</g, '&lt;')}</textarea>
+       <button id="planRunBtn" type="button" style="margin-top:6px;font-size:12.5px;padding:5px 14px;border-radius:6px;border:1px solid #34d399;background:#34d39922;color:#34d399;cursor:pointer">🍲 开始排期（约几分钟）</button>`;
+    document.getElementById('planRunBtn').addEventListener('click', () => {
+      const sid = document.getElementById('planSongId').value.trim();
+      advisorLyrics = document.getElementById('planLyrics').value.trim();
+      if (!sid) { alert('请填 Suno song_id'); return; }
+      runPlan(sid, advisorLyrics);
+    });
+  });
+
+  async function runPlan(songId, lyrics) {
+    const btn = document.getElementById('planBtn'), panel = document.getElementById('planPanel');
+    btn.disabled = true;
+    panel.innerHTML = '🎬 结构排期启动中…（切镜头槽 → 逐图理解 → CPU 排期,约几分钟,别关页面）';
+    try {
+      const form = new FormData();
+      imgFiles.forEach(f => form.append('images', f));
+      form.append('audio', audFile);
+      form.append('song_id', songId);
+      form.append('lyrics', lyrics || '');
+      const r0 = await fetch('/api/plan/start', { method: 'POST', body: form });
+      const d0 = await r0.json();
+      if (d0.error) throw new Error(d0.error);
+      const tid = d0.tid, t0 = Date.now();
+      const poll = setInterval(async () => {
+        try {
+          const d = await (await fetch('/api/plan/status/' + tid)).json();
+          const sec = Math.round((Date.now() - t0) / 1000);
+          if (!d.state) { clearInterval(poll); btn.disabled = false; panel.innerHTML = '⚠️ 排期任务丢失,请重点「🎬 结构分镜排期」。'; return; }
+          if (d.state === 'running') { panel.innerHTML = `🎬 ${d.msg || '排期中'}　<span style="color:var(--muted)">（已 ${sec}s）</span>`; }
+          else if (d.state === 'done') { clearInterval(poll); btn.disabled = false; renderPlan(d.result); }
+          else if (d.state === 'error') { clearInterval(poll); btn.disabled = false; panel.innerHTML = `❌ 排期失败：${d.error}<br><span style="color:var(--muted)">多为 gemma 偶发坏输出,直接重跑一次多半就好;或检查 suno-api(:3000)/song_id。</span>`; }
+        } catch (e) {}
+      }, 2500);
+    } catch (e) { btn.disabled = false; panel.innerHTML = '❌ 启动失败：' + e.message; }
+  }
+
+  let planImg = [], planMotion = [];
+  const MOTIONS = ['推近', '拉远', '左右移', '上下移', '放大横移'];
+  function renderPlan(r) {
+    planResult = r;
+    const panel = document.getElementById('planPanel');
+    const esc = s => (s || '').replace(/[<>&]/g, c => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;' }[c]));
+    const byslot = {}; (r.plan || []).forEach(p => byslot[p.slot] = p);
+    const empty = new Set((r.coverage && r.coverage.empty_images) || []);
+    const slots = r.slots || [];
+    // 每槽可编辑状态:图/运镜/空镜
+    planImg = slots.map(s => (byslot[s.i] || {}).img || 1);
+    planMotion = slots.map(s => (byslot[s.i] || {}).motion || '推近');
+    planStatic = slots.map(s => { const p = byslot[s.i] || {}; return p.static !== undefined ? !!p.static : (s.role === '空镜' || empty.has(p.img)); });
+    // 收起旧的逐图列表 + 藏掉旧的"生成多机位"大按钮(防误点;结构流程只走下面的 🚀)
+    document.getElementById('perPromptList').style.display = 'none';
+    document.getElementById('advisorPanel').style.display = 'none';
+    const _gb = document.getElementById('goBtn'); if (_gb) _gb.style.display = 'none';
+    const _gn = document.getElementById('goNote'); if (_gn) _gn.style.display = 'none';
+
+    const imgOpts = i => imgFiles.map((f, k) => `<option value="${k + 1}" ${planImg[i] === k + 1 ? 'selected' : ''}>图${k + 1}</option>`).join('');
+    const moOpts = i => MOTIONS.map(m => `<option ${planMotion[i] === m ? 'selected' : ''}>${m}</option>`).join('');
+    let h = `<div style="margin-bottom:8px"><b>🎬 分镜表 · 可编辑</b>（${slots.length} 镜,切点已贴音乐结构）—— 换图调顺序 / 选运镜 / 勾🛰️空镜(=静帧,不勾=云机对口型)</div>`;
+    h += `<div style="display:grid;grid-template-columns:34px 30px 1fr 84px 78px 52px;gap:6px;align-items:center;font-size:11px;color:var(--muted);padding:0 2px 4px">
+      <div></div><div>镜</div><div>段落·时长</div><div>画面</div><div>运镜</div><div>空镜</div></div>`;
+    h += slots.map(s => {
+      const f = imgFiles[planImg[s.i] - 1];
+      const thumb = f ? `<img class="planThumb" data-i="${s.i}" src="${URL.createObjectURL(f)}" style="width:34px;height:34px;object-fit:cover;border-radius:4px">` : '';
+      return `<div style="display:grid;grid-template-columns:34px 30px 1fr 84px 78px 52px;gap:6px;align-items:center;padding:2px;border-top:1px solid #34d39922">
+        ${thumb}
+        <div style="font-size:11px;color:var(--muted)">${s.i}</div>
+        <div style="font-size:11.5px">[${esc(s.section)}]<br><span style="color:var(--muted)">${s.dur}s</span></div>
+        <select class="planImg" data-i="${s.i}" style="font-size:11.5px;padding:2px">${imgOpts(s.i)}</select>
+        <select class="planMo" data-i="${s.i}" style="font-size:11.5px;padding:2px">${moOpts(s.i)}</select>
+        <input type="checkbox" class="planStatic" data-i="${s.i}" ${planStatic[s.i] ? 'checked' : ''} style="justify-self:center;transform:scale(1.2)">
+      </div>`;
+    }).join('');
+    if (r.coverage && r.coverage.tips) h += `<div style="margin-top:8px;padding-top:6px;border-top:1px solid #34d39933;font-size:12px">📋 <b>覆盖度体检</b>：${r.coverage.tips.map(esc).join('；')}</div>`;
+    h += `<div style="margin-top:10px"><button id="planSubmitBtn" type="button" style="font-size:13px;padding:7px 18px;border-radius:7px;border:1px solid #34d399;background:#34d39933;color:#34d399;cursor:pointer">🚀 提交云机渲染</button>
+      <span id="planCount" style="color:var(--muted);font-size:11.5px;margin-left:8px"></span></div>`;
+    panel.innerHTML = h;
+    const updCount = () => { document.getElementById('planCount').textContent =
+      `${slots.length} 镜:${planStatic.filter(x => !x).length} 口型 + ${planStatic.filter(x => x).length} 空镜 · 记得开 AutoDL worker`; };
+    panel.querySelectorAll('.planStatic').forEach(c => c.addEventListener('change', () => { planStatic[+c.dataset.i] = c.checked; updCount(); }));
+    panel.querySelectorAll('.planMo').forEach(sel => sel.addEventListener('change', () => { planMotion[+sel.dataset.i] = sel.value; }));
+    panel.querySelectorAll('.planImg').forEach(sel => sel.addEventListener('change', () => {
+      const i = +sel.dataset.i; planImg[i] = +sel.value;
+      const th = panel.querySelector(`.planThumb[data-i="${i}"]`);
+      if (th && imgFiles[planImg[i] - 1]) th.src = URL.createObjectURL(imgFiles[planImg[i] - 1]);
+    }));
+    document.getElementById('planSubmitBtn').addEventListener('click', submitPlanned);
+    updCount();
+  }
+
+  async function submitPlanned() {
+    const btn = document.getElementById('planSubmitBtn');
+    const err = m => { const c = document.getElementById('planCount'); if (c) c.innerHTML = `<span style="color:#f87171">❌ ${m}</span>`; if (btn) { btn.disabled = false; btn.textContent = '🚀 提交云机渲染'; } };
+    try {
+      if (!planResult || !(planResult.slots || []).length) { err('分镜表为空,请先跑结构排期'); return; }
+      if (!audFile) { err('缺音频,请先上传歌曲'); return; }
+      btn.disabled = true; btn.textContent = '上传提交中…';
+      const slots = planResult.slots;
+      const cuts = [slots[0].start].concat(slots.map(s => s.end));   // n+1 个切点
+      const form = new FormData();
+      form.append('audio', audFile);
+      form.append('prompt', document.getElementById('prompt').value);
+      form.append('cuts', JSON.stringify(cuts));
+      slots.forEach(s => {
+        const f = imgFiles[planImg[s.i] - 1];
+        form.append('images', f);
+        form.append('static', planStatic[s.i] ? '1' : '0');
+        form.append('motion', planMotion[s.i] || '');
+        form.append('prompts', '');
+      });
+      const d = await (await fetch('/api/create_mtv', { method: 'POST', body: form })).json();
+      if (d.error) { err('提交失败:' + d.error); return; }
+      curJob = d.job_id; localStorage.setItem('curJob', curJob);
+      document.getElementById('inputArea').style.display = 'none';
+      document.getElementById('progressCard').style.display = 'block';
+      listen(d.job_id);
+    } catch (e) { err('提交异常:' + e.message); }
   }
 
   (function () {

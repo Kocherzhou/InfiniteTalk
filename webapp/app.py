@@ -485,13 +485,21 @@ def api_create_mtv():
     static_flags = request.form.getlist("static")
     # 逐张军师运镜建议(与 images 同序,如"推近/拉远/左右移";空=未用军师)。存档给本地 finalize 用
     motion_flags = request.form.getlist("motion")
+    # 显式切点(结构分镜排期产出的非均匀刀口,含 0 与结尾,共 n+1 个);空=退回均分智能刀口
+    cuts_json = (request.form.get("cuts") or "").strip()
     n = len(images)
     parent_id = uuid.uuid4().hex
     apath = UPLOAD_DIR / f"{parent_id}_audio.{_ext(audio.filename, AUDIO_EXTS, 'wav')}"
     audio.save(str(apath))
 
     try:
-        cuts = smart_cut_points(str(apath), n)                  # 智能刀口（吸附最静换气处）
+        if cuts_json:
+            cuts = [float(x) for x in json.loads(cuts_json)]
+            if len(cuts) != n + 1:
+                return jsonify({"error": f"切点数({len(cuts)})与图片数({n})不匹配,应为图数+1"}), 400
+            cuts[0] = 0.0; cuts[-1] = _audio_duration(str(apath))   # 钉死首尾
+        else:
+            cuts = smart_cut_points(str(apath), n)                  # 智能刀口（吸附最静换气处）
         vad = vocal_activity_profile(str(apath), cuts)          # 复用同一刀口做人声活动检测
         segs = split_audio_at(str(apath), cuts, str(UPLOAD_DIR / parent_id))
     except Exception as e:
@@ -586,6 +594,49 @@ def api_advisor_status(tid):
         return jsonify(json.loads(f.read_text(encoding="utf-8")))
     except Exception:
         return jsonify({"state": "running", "msg": "读取中…"})   # 写盘瞬间偶发,下次轮询即好
+
+
+# ── 结构分镜排期(切镜头槽 + 军师 plan_shots)──────────────────────────────
+# start 存图+音频+meta(song_id/歌词)→ 起独立子进程 plan_runner.py;status 读盘。
+@app.route("/api/plan/start", methods=["POST"])
+def api_plan_start():
+    images = [im for im in request.files.getlist("images") if im and im.filename]
+    audio = request.files.get("audio")
+    song_id = (request.form.get("song_id") or "").strip()
+    lyrics = (request.form.get("lyrics") or "").strip()
+    if len(images) < 2:
+        return jsonify({"error": "至少 2 张图"}), 400
+    if not audio or not audio.filename:
+        return jsonify({"error": "请上传歌曲音频"}), 400
+    if not song_id:
+        return jsonify({"error": "请填 Suno song_id(结构切镜需要它的逐词对齐)"}), 400
+    tid = uuid.uuid4().hex
+    for i, im in enumerate(images):
+        im.save(str(UPLOAD_DIR / f"adv_{tid}_{i}.{_ext(im.filename, IMAGE_EXTS, 'png')}"))
+    apath = UPLOAD_DIR / f"adv_{tid}_audio.{_ext(audio.filename, AUDIO_EXTS, 'wav')}"
+    audio.save(str(apath))
+    (UPLOAD_DIR / f"adv_{tid}_meta.json").write_text(json.dumps(
+        {"song_id": song_id, "lyrics": lyrics, "audio": str(apath)}, ensure_ascii=False),
+        encoding="utf-8")
+    (UPLOAD_DIR / f"adv_{tid}_plan_status.json").write_text(json.dumps(
+        {"state": "running", "stage": "slots", "i": 0, "n": len(images),
+         "msg": "结构排期启动…", "result": None, "error": None}, ensure_ascii=False),
+        encoding="utf-8")
+    subprocess.Popen(["/usr/bin/python3", str(BASE / "plan_runner.py"), tid],
+                     cwd=str(BASE), start_new_session=True,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return jsonify({"tid": tid})
+
+
+@app.route("/api/plan/status/<tid>")
+def api_plan_status(tid):
+    f = UPLOAD_DIR / f"adv_{tid}_plan_status.json"
+    if not f.exists():
+        return jsonify({"error": "无此任务"}), 404
+    try:
+        return jsonify(json.loads(f.read_text(encoding="utf-8")))
+    except Exception:
+        return jsonify({"state": "running", "msg": "读取中…"})
 
 
 def _finalize_parent(child):
@@ -732,11 +783,14 @@ def worker_progress(job_id):
     job["_updated"] = time.time()
     if d.get("log"):
         add_log(job, str(d["log"]), d.get("log_type", "info"))
-    # 子任务进度时，顺带刷新父任务的"第 k/N 段生成中"提示
+    # 子任务进度时刷新父任务提示：用"已完成 X/N(单调)+ Y 段并行中"，不再显示某个乱跳的段号
     pid = job.get("_parent")
     parent = jobs.get(pid) if pid else None
     if parent and parent.get("status") == "mtv_running":
-        parent["message"] = f"第 {job.get('seg_index', 0) + 1}/{parent['n']} 段云端生成中…"
+        kids = [jobs.get(c) for c in parent.get("children", [])]
+        done = sum(1 for k in kids if k and k.get("status") == "completed")
+        running = sum(1 for k in kids if k and k.get("status") in ("claimed", "generating", "uploading"))
+        parent["message"] = f"已完成 {done}/{parent['n']} 段 · {running} 段并行生成中…"
     save_jobs()
     return jsonify({"ok": True})
 
